@@ -1,3 +1,5 @@
+from dotenv import load_dotenv
+load_dotenv()
 import os
 import json
 import numpy as np
@@ -5,16 +7,16 @@ import pandas as pd
 from openai import AzureOpenAI
 import faiss
 
-# ---- 1. CONFIGURATION ----
-dataset_path = "mini_rag.csv"
+# CONFIGURATION
+dataset_path = "good_rag.csv"
 faiss_index_path = "rag_index_openai.faiss"
 metadata_path = "rag_metadata_openai.json"
 column_for_context = "questions"
-num_retrievals = 3  # Fewer since dataset is tiny
+num_retrievals = 3
 
-# ---- 2. ENVIRONMENT ----
+# ENVIRONMENT
 api_key = os.getenv("AZURE_OPENAI_API_KEY")
-api_version = "2024-10-21"
+api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-10-21")
 azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
 if not api_key or not azure_endpoint:
     raise RuntimeError("Missing Azure OpenAI credentials in environment variables.")
@@ -25,7 +27,7 @@ client = AzureOpenAI(
     azure_endpoint=azure_endpoint
 )
 
-# ---- 3. LOAD DATA ----
+# LOAD DATA AND INDEX
 print("Loading data and index...")
 df = pd.read_csv(dataset_path)
 index = faiss.read_index(faiss_index_path)
@@ -33,7 +35,7 @@ with open(metadata_path, "r") as f:
     metadata = json.load(f)
 print(f"Loaded {len(df)} data rows, {index.ntotal} vectors in index.")
 
-# ---- 4. START CHAT LOOP ----
+# CHAT LOOP
 conversation = [{"role": "system", "content": "You are a helpful assistant."}]
 
 while True:
@@ -45,7 +47,7 @@ while True:
     try:
         # Get query embedding
         emb_resp = client.embeddings.create(
-            model="text-embedding-3-large",
+            model="text-embedding-3-small",  # Your deployment name here
             input=[query]
         )
         query_emb = np.array(emb_resp.data[0].embedding, dtype=np.float32)
@@ -72,7 +74,7 @@ while True:
 
         # Chat completion
         response = client.chat.completions.create(
-            model="gpt-4o",  # Replace with your Azure deployment name if needed
+            model="gpt-4o-mini",  # Your chat model deployment name here
             messages=conversation
         )
         answer = response.choices[0].message.content
