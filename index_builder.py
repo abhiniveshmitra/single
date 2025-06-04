@@ -7,9 +7,8 @@ from openai import AzureOpenAI
 from tqdm import tqdm
 
 # ---- 1. CONFIGURATION ----
-# Update these if needed:
-dataset_path = r"C:\Users\abhin\OneDrive\Desktop\event-portal\denniswang07\datasets-for-rag\versions\1\output.csv"
-column_to_embed = "questions"  # Use your actual context column
+dataset_path = "mini_rag.csv"
+column_to_embed = "questions"  # The context column
 faiss_index_path = "rag_index_openai.faiss"
 metadata_path = "rag_metadata_openai.json"
 
@@ -38,7 +37,6 @@ print(f"Loaded {len(texts)} chunks.")
 all_embeddings = []
 print("Generating embeddings with OpenAI (may take a while)...")
 for text in tqdm(texts, desc="Embedding", unit="chunk"):
-    # Call OpenAI API (batched for speed if desired, here 1 by 1 for clarity)
     response = client.embeddings.create(
         model="text-embedding-3-large",
         input=[text]
