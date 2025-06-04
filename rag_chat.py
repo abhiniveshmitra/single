@@ -6,11 +6,11 @@ from openai import AzureOpenAI
 import faiss
 
 # ---- 1. CONFIGURATION ----
-dataset_path = r"C:\Users\abhin\OneDrive\Desktop\event-portal\denniswang07\datasets-for-rag\versions\1\output.csv"
+dataset_path = "mini_rag.csv"
 faiss_index_path = "rag_index_openai.faiss"
 metadata_path = "rag_metadata_openai.json"
 column_for_context = "questions"
-num_retrievals = 5
+num_retrievals = 3  # Fewer since dataset is tiny
 
 # ---- 2. ENVIRONMENT ----
 api_key = os.getenv("AZURE_OPENAI_API_KEY")
@@ -72,7 +72,7 @@ while True:
 
         # Chat completion
         response = client.chat.completions.create(
-            model="gpt-4o",  # Replace with your Azure deployment name if different
+            model="gpt-4o",  # Replace with your Azure deployment name if needed
             messages=conversation
         )
         answer = response.choices[0].message.content
