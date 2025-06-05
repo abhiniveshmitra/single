@@ -1,201 +1,230 @@
 import streamlit as st
 import datetime
 import os
-import traceback
-import numpy as np
+import sqlite3
 from dotenv import load_dotenv
+import traceback
 
-# ---- Azure OpenAI setup ----
-try:
-    load_dotenv()
-    AZURE_OPENAI_KEY = os.getenv("AZURE_OPENAI_KEY")
-    AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
-    from openai import AzureOpenAI
-    client = AzureOpenAI(
-        api_key=AZURE_OPENAI_KEY,
-        azure_endpoint=AZURE_OPENAI_ENDPOINT,
-        api_version="2025-01-01-preview"
+# ---- SQLite Setup ----
+DB_PATH = "chatgpt.sqlite"
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    # Table for chat threads
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS threads (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            created TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    # Table for messages
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            thread_id INTEGER,
+            role TEXT,
+            content TEXT,
+            time TEXT,
+            FOREIGN KEY(thread_id) REFERENCES threads(id)
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# ---- Helper functions ----
+def list_threads():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT id, name FROM threads ORDER BY created DESC")
+    threads = cur.fetchall()
+    conn.close()
+    return threads
+
+def create_thread(name):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("INSERT INTO threads (name) VALUES (?)", (name,))
+    thread_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return thread_id
+
+def rename_thread(thread_id, new_name):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("UPDATE threads SET name=? WHERE id=?", (new_name, thread_id))
+    conn.commit()
+    conn.close()
+
+def delete_thread(thread_id):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM messages WHERE thread_id=?", (thread_id,))
+    cur.execute("DELETE FROM threads WHERE id=?", (thread_id,))
+    conn.commit()
+    conn.close()
+
+def save_message(thread_id, role, content, time):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO messages (thread_id, role, content, time) VALUES (?, ?, ?, ?)",
+        (thread_id, role, content, time)
     )
-except Exception:
-    st.error("Azure OpenAI initialization failed!\n\n" + traceback.format_exc())
-    st.stop()
+    conn.commit()
+    conn.close()
 
-# ---- ChromaDB setup (with robust dummy embedding) ----
-try:
-    import chromadb
-
-    # Dummy embedding function class that satisfies ChromaDB's requirements
-    class DummyEmbeddingFunction:
-        name = "default"
-        def __call__(self, texts):
-            # returns a fixed-size, valid float32 vector for each input
-            return [np.zeros(384, dtype=np.float32) for _ in texts]
-
-    chroma_client = chromadb.PersistentClient(path="./chat_db")
-    collection = chroma_client.get_or_create_collection(
-        "chat_history",
-        embedding_function=DummyEmbeddingFunction(),
-        metadata={"hnsw:space": "cosine"}
+def get_messages(thread_id):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT role, content, time FROM messages WHERE thread_id=? ORDER BY id",
+        (thread_id,)
     )
-except Exception:
-    st.error("ChromaDB initialization failed!\n\n" + traceback.format_exc())
-    st.stop()
+    msgs = cur.fetchall()
+    conn.close()
+    return [{"role": r, "content": c, "time": t} for r, c, t in msgs]
 
-# ---- Persistence Helpers ----
-def load_history():
-    try:
-        docs = collection.get(include=['documents', 'metadatas'])
-        messages = []
-        if docs.get('documents'):
-            for doc, meta in zip(docs['documents'], docs['metadatas']):
-                messages.append({
-                    "role": meta.get('role', ''),
-                    "content": doc,
-                    "time": meta.get("time", "")
-                })
-        return messages
-    except Exception:
-        st.error("Failed to load chat history!\n\n" + traceback.format_exc())
-        return []
+def clear_thread(thread_id):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM messages WHERE thread_id=?", (thread_id,))
+    conn.commit()
+    conn.close()
 
-def save_history(messages):
-    try:
-        ids = [str(i) for i in range(len(messages))]
-        roles = [msg["role"] for msg in messages]
-        contents = [msg["content"] for msg in messages]
-        times = [msg.get("time", "") for msg in messages]
-        old_ids = collection.get()['ids']
-        if old_ids:
-            collection.delete(ids=old_ids)
-        if contents:
-            collection.add(
-                documents=contents,
-                metadatas=[{"role": r, "time": t} for r, t in zip(roles, times)],
-                ids=ids
-            )
-    except Exception:
-        st.error("Failed to save chat history!\n\n" + traceback.format_exc())
+# ---- Azure OpenAI Setup ----
+load_dotenv()
+AZURE_OPENAI_KEY = os.getenv("AZURE_OPENAI_KEY")
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
+from openai import AzureOpenAI
 
-def clear_history():
-    try:
-        old_ids = collection.get()['ids']
-        if old_ids:
-            collection.delete(ids=old_ids)
-    except Exception:
-        st.error("Failed to clear chat history!\n\n" + traceback.format_exc())
+client = AzureOpenAI(
+    api_key=AZURE_OPENAI_KEY,
+    azure_endpoint=AZURE_OPENAI_ENDPOINT,
+    api_version="2025-01-01-preview"
+)
 
-# ---- Streamlit Page Setup ----
+# ---- Streamlit App ----
 st.set_page_config(page_title="ChatGPT-like Azure Chat", page_icon="💬", layout="wide")
-st.markdown("<style>textarea{font-size:1.1em;}</style>", unsafe_allow_html=True)
+
+# --- Sidebar: Thread/Chat selection
+st.sidebar.title("💬 Chats")
+
+threads = list_threads()
+if 'current_thread_id' not in st.session_state:
+    # If no threads, create a default one
+    if not threads:
+        tid = create_thread("New Chat")
+        st.session_state.current_thread_id = tid
+    else:
+        st.session_state.current_thread_id = threads[0][0]
+
+# Select thread
+thread_names = [name for _, name in threads]
+thread_ids = [tid for tid, _ in threads]
+selected_idx = 0
+if st.session_state.current_thread_id in thread_ids:
+    selected_idx = thread_ids.index(st.session_state.current_thread_id)
+selected = st.sidebar.radio(
+    "Conversations",
+    options=thread_ids,
+    format_func=lambda tid: [name for i, name in threads if i == tid][0],
+    index=selected_idx
+)
+st.session_state.current_thread_id = selected
+
+# --- Sidebar controls
+col1, col2, col3 = st.sidebar.columns(3)
+with col1:
+    if st.button("➕", help="New Chat"):
+        new_id = create_thread("New Chat")
+        st.session_state.current_thread_id = new_id
+        st.experimental_rerun()
+with col2:
+    if st.button("✏️", help="Rename"):
+        new_name = st.text_input("Rename Chat", value=[name for i, name in threads if i == st.session_state.current_thread_id][0], key="renamebox")
+        if st.button("Save", key="saverename"):
+            rename_thread(st.session_state.current_thread_id, new_name)
+            st.experimental_rerun()
+with col3:
+    if st.button("🗑️", help="Delete"):
+        delete_thread(st.session_state.current_thread_id)
+        threads = list_threads()
+        if threads:
+            st.session_state.current_thread_id = threads[0][0]
+        else:
+            st.session_state.current_thread_id = create_thread("New Chat")
+        st.experimental_rerun()
+
+st.sidebar.markdown("---")
+st.sidebar.write("Click 'New Chat' to start a new conversation.")
+
+# --- Main Chat area
 st.title("💬 ChatGPT-like Azure Chat")
 
-# ---- Load messages into session_state ----
-if 'messages' not in st.session_state:
-    try:
-        st.session_state.messages = load_history()
-    except Exception:
-        st.session_state.messages = []
-        st.error("Failed to load messages at startup!\n\n" + traceback.format_exc())
+messages = get_messages(st.session_state.current_thread_id)
 
-# ---- Styling ----
-st.markdown("""
-    <style>
-    .bubble-user {
-        background: linear-gradient(135deg, #0078fe 0%, #19c2fa 100%);
-        color: white;
-        border-radius: 1em 1em 0.1em 1em;
-        padding: 12px 18px;
-        margin: 8px 0 8px 20%;
-        max-width: 80%;
-        float: right;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.04);
-    }
-    .bubble-assistant {
-        background: #f4f4f8;
-        color: #222;
-        border-radius: 1em 1em 1em 0.1em;
-        padding: 12px 18px;
-        margin: 8px 20% 8px 0;
-        max-width: 80%;
-        float: left;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.05);
-    }
-    .bubble-time {
-        font-size:0.75em;color:#888;margin-top:2px;
-    }
-    .chat-row:after { content: ""; display: table; clear: both; }
-    </style>
-""", unsafe_allow_html=True)
+for msg in messages:
+    bubble = "bubble-user" if msg["role"] == "user" else "bubble-assistant"
+    st.markdown(
+        f"""
+        <div style="background-color: {'#0078fe' if msg['role']=='user' else '#f4f4f8'};
+                    color: {'white' if msg['role']=='user' else '#222'};
+                    border-radius:1em; padding:12px 18px; margin-bottom:8px; max-width:70%; float:{'right' if msg['role']=='user' else 'left'}; box-shadow:0 2px 8px rgba(0,0,0,0.04); clear:both;">
+        {msg['content']}
+        <div style="font-size:0.75em;color:#888;margin-top:2px;">{msg['time']}</div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
 
-# ---- Chat Display ----
-try:
-    for msg in st.session_state.messages:
-        bubble = "bubble-user" if msg["role"] == "user" else "bubble-assistant"
-        time_str = msg.get("time", "")
-        st.markdown(
-            f"<div class='chat-row'><div class='{bubble}'>{msg['content']}<div class='bubble-time'>{time_str}</div></div></div>",
-            unsafe_allow_html=True
-        )
-except Exception:
-    st.error("Error displaying chat messages!\n\n" + traceback.format_exc())
-
-# ---- Input Form ----
+# --- Input area
 with st.form("chat-form", clear_on_submit=True):
     user_input = st.text_area(
         "Type your message...",
         key="user_input",
         label_visibility="collapsed",
-        height=80,  # <-- You requested 80px height
+        height=80,
         max_chars=500
     )
     send = st.form_submit_button("Send", use_container_width=True)
 
-# ---- Clear Chat Button ----
-col1, col2 = st.columns([9,1])
-with col2:
-    if st.button("🗑️", help="Clear Chat"):
-        try:
-            clear_history()
-            st.session_state.messages = []
-            st.rerun()
-        except Exception:
-            st.error("Failed to clear chat!\n\n" + traceback.format_exc())
+if st.button("🧹 Clear Chat History", key="clearchat"):
+    clear_thread(st.session_state.current_thread_id)
+    st.experimental_rerun()
 
-# ---- Message Sending Logic ----
 if send and user_input.strip():
-    try:
-        now = datetime.datetime.now().strftime("%H:%M")
-        st.session_state.messages.append({
-            "role": "user",
-            "content": user_input,
-            "time": now
-        })
-        save_history(st.session_state.messages)
-        with st.spinner("Assistant is typing..."):
-            try:
-                ai_response = client.chat.completions.create(
-                    model="gpt-4o-mini",  # Your deployment/model name
-                    messages=[
-                        {"role": msg["role"], "content": msg["content"]}
-                        for msg in st.session_state.messages
-                    ],
-                    max_tokens=500
-                )
-                response_content = ai_response.choices[0].message.content
-                now2 = datetime.datetime.now().strftime("%H:%M")
-                st.session_state.messages.append({
-                    "role": "assistant",
-                    "content": response_content,
-                    "time": now2
-                })
-                save_history(st.session_state.messages)
-                st.rerun()
-            except Exception:
-                st.error("Azure OpenAI API call failed!\n\n" + traceback.format_exc())
-    except Exception:
-        st.error("Failed to send or save your message!\n\n" + traceback.format_exc())
+    now = datetime.datetime.now().strftime("%H:%M")
+    save_message(st.session_state.current_thread_id, "user", user_input, now)
+    st.experimental_rerun()
+    # After rerun, below code sends to Azure OpenAI and saves response
 
-# ---- Auto-scroll JS ----
+# Get latest messages after any new user message
+messages = get_messages(st.session_state.current_thread_id)
+
+# If last message is user and not yet answered by assistant, call API
+if messages and messages[-1]['role'] == 'user' and (len(messages) == 1 or messages[-2]['role'] == 'assistant' or len(messages)==1):
+    with st.spinner("Assistant is typing..."):
+        try:
+            ai_response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": m["role"], "content": m["content"]} for m in messages
+                ],
+                max_tokens=500
+            )
+            response_content = ai_response.choices[0].message.content
+            now2 = datetime.datetime.now().strftime("%H:%M")
+            save_message(st.session_state.current_thread_id, "assistant", response_content, now2)
+            st.experimental_rerun()
+        except Exception as e:
+            st.error("Azure OpenAI API call failed!\n\n" + str(e))
+
+# --- Tiny JS for auto-scroll
 st.markdown("""
     <script>
     var chatDiv = window.parent.document.querySelector('section.main');
