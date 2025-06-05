@@ -14,22 +14,41 @@ try:
     client = AzureOpenAI(
         api_key=AZURE_OPENAI_KEY,
         azure_endpoint=AZURE_OPENAI_ENDPOINT,
-        api_version="2024-02-15-preview"
+        api_version="2025-01-01-preview"
     )
-except Exception as e:
+except Exception:
     st.error("Azure OpenAI initialization failed!\n\n" + traceback.format_exc())
     st.stop()
 
 # ---- ChromaDB setup ----
 try:
     import chromadb
+    from chromadb.utils.embedding_functions import OpenAIEmbeddingFunction
+
     chroma_client = chromadb.PersistentClient(path="./chat_db")
-    # Dummy embedding function so we don't need onnxruntime!
-    collection = chroma_client.get_or_create_collection(
-        "chat_history",
-        embedding_function=lambda x: [[0.0]] * len(x)
-    )
-except Exception as e:
+
+    # ---- Set this to False if you do NOT want semantic search/embeddings ----
+    USE_EMBEDDINGS = False
+
+    if USE_EMBEDDINGS:
+        # You can set your Azure embedding deployment here
+        embed_fn = OpenAIEmbeddingFunction(
+            api_key=AZURE_OPENAI_KEY,
+            api_base=AZURE_OPENAI_ENDPOINT,
+            model_name="text-embedding-3-small",  # Or your Azure embedding deployment name
+            api_type="azure"
+        )
+        collection = chroma_client.get_or_create_collection(
+            "chat_history",
+            embedding_function=embed_fn
+        )
+    else:
+        # No embeddings, pure text/document storage
+        collection = chroma_client.get_or_create_collection(
+            "chat_history",
+            embedding_function=None
+        )
+except Exception:
     st.error("ChromaDB initialization failed!\n\n" + traceback.format_exc())
     st.stop()
 
@@ -46,7 +65,7 @@ def load_history():
                     "time": meta.get("time", "")
                 })
         return messages
-    except Exception as e:
+    except Exception:
         st.error("Failed to load chat history!\n\n" + traceback.format_exc())
         return []
 
@@ -65,7 +84,7 @@ def save_history(messages):
                 metadatas=[{"role": r, "time": t} for r, t in zip(roles, times)],
                 ids=ids
             )
-    except Exception as e:
+    except Exception:
         st.error("Failed to save chat history!\n\n" + traceback.format_exc())
 
 def clear_history():
@@ -73,7 +92,7 @@ def clear_history():
         old_ids = collection.get()['ids']
         if old_ids:
             collection.delete(ids=old_ids)
-    except Exception as e:
+    except Exception:
         st.error("Failed to clear chat history!\n\n" + traceback.format_exc())
 
 # ---- Streamlit Page Setup ----
@@ -85,7 +104,7 @@ st.title("💬 ChatGPT-like Azure Chat")
 if 'messages' not in st.session_state:
     try:
         st.session_state.messages = load_history()
-    except Exception as e:
+    except Exception:
         st.session_state.messages = []
         st.error("Failed to load messages at startup!\n\n" + traceback.format_exc())
 
@@ -128,7 +147,7 @@ try:
             f"<div class='chat-row'><div class='{bubble}'>{msg['content']}<div class='bubble-time'>{time_str}</div></div></div>",
             unsafe_allow_html=True
         )
-except Exception as e:
+except Exception:
     st.error("Error displaying chat messages!\n\n" + traceback.format_exc())
 
 # ---- Input Form ----
@@ -137,7 +156,7 @@ with st.form("chat-form", clear_on_submit=True):
         "Type your message...",
         key="user_input",
         label_visibility="collapsed",
-        height=40,
+        height=80,  # <-- You requested 80px height
         max_chars=500
     )
     send = st.form_submit_button("Send", use_container_width=True)
@@ -149,8 +168,8 @@ with col2:
         try:
             clear_history()
             st.session_state.messages = []
-            st.experimental_rerun()
-        except Exception as e:
+            st.rerun()
+        except Exception:
             st.error("Failed to clear chat!\n\n" + traceback.format_exc())
 
 # ---- Message Sending Logic ----
@@ -166,7 +185,7 @@ if send and user_input.strip():
         with st.spinner("Assistant is typing..."):
             try:
                 ai_response = client.chat.completions.create(
-                    model="gpt-4o",  # Or your deployment name
+                    model="gpt-4o-mini",  # Your model name
                     messages=[
                         {"role": msg["role"], "content": msg["content"]}
                         for msg in st.session_state.messages
@@ -181,10 +200,10 @@ if send and user_input.strip():
                     "time": now2
                 })
                 save_history(st.session_state.messages)
-                st.experimental_rerun()
-            except Exception as e:
+                st.rerun()
+            except Exception:
                 st.error("Azure OpenAI API call failed!\n\n" + traceback.format_exc())
-    except Exception as e:
+    except Exception:
         st.error("Failed to send or save your message!\n\n" + traceback.format_exc())
 
 # ---- Auto-scroll JS ----
