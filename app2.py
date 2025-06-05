@@ -1,62 +1,95 @@
 import streamlit as st
 import datetime
 import os
-import chromadb
+import traceback
+
 from dotenv import load_dotenv
 
-# Load Azure keys from .env
-load_dotenv()
-AZURE_OPENAI_KEY = os.getenv("AZURE_OPENAI_KEY")
-AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
+# ---- Azure OpenAI setup ----
+try:
+    load_dotenv()
+    AZURE_OPENAI_KEY = os.getenv("AZURE_OPENAI_KEY")
+    AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
+    from openai import AzureOpenAI
+    client = AzureOpenAI(
+        api_key=AZURE_OPENAI_KEY,
+        azure_endpoint=AZURE_OPENAI_ENDPOINT,
+        api_version="2024-02-15-preview"
+    )
+except Exception as e:
+    st.error("Azure OpenAI initialization failed!\n\n" + traceback.format_exc())
+    st.stop()
 
-from openai import AzureOpenAI
+# ---- ChromaDB setup ----
+try:
+    import chromadb
+    chroma_client = chromadb.PersistentClient(path="./chat_db")
+    # Dummy embedding function so we don't need onnxruntime!
+    collection = chroma_client.get_or_create_collection(
+        "chat_history",
+        embedding_function=lambda x: [[0.0]] * len(x)
+    )
+except Exception as e:
+    st.error("ChromaDB initialization failed!\n\n" + traceback.format_exc())
+    st.stop()
 
-# --- Your existing Azure client initialization ---
-client = AzureOpenAI(
-    api_key=AZURE_OPENAI_KEY,
-    azure_endpoint=AZURE_OPENAI_ENDPOINT,
-    api_version="2024-02-15-preview"
-)
-
-# --- ChromaDB persistence setup ---
-chroma_client = chromadb.PersistentClient(path="./chat_db")
-collection = chroma_client.get_or_create_collection("chat_history")
-
+# ---- Persistence Helpers ----
 def load_history():
-    docs = collection.get(include=['documents', 'metadatas'])
-    messages = []
-    if docs['documents']:
-        for doc, meta in zip(docs['documents'], docs['metadatas']):
-            messages.append({
-                "role": meta['role'],
-                "content": doc,
-                "time": meta.get("time", "")
-            })
-    return messages
+    try:
+        docs = collection.get(include=['documents', 'metadatas'])
+        messages = []
+        if docs.get('documents'):
+            for doc, meta in zip(docs['documents'], docs['metadatas']):
+                messages.append({
+                    "role": meta.get('role', ''),
+                    "content": doc,
+                    "time": meta.get("time", "")
+                })
+        return messages
+    except Exception as e:
+        st.error("Failed to load chat history!\n\n" + traceback.format_exc())
+        return []
 
 def save_history(messages):
-    ids = [str(i) for i in range(len(messages))]
-    roles = [msg["role"] for msg in messages]
-    contents = [msg["content"] for msg in messages]
-    times = [msg.get("time", "") for msg in messages]
-    collection.delete(ids=collection.get()['ids'])
-    if contents:
-        collection.add(
-            documents=contents,
-            metadatas=[{"role": r, "time": t} for r, t in zip(roles, times)],
-            ids=ids
-        )
+    try:
+        ids = [str(i) for i in range(len(messages))]
+        roles = [msg["role"] for msg in messages]
+        contents = [msg["content"] for msg in messages]
+        times = [msg.get("time", "") for msg in messages]
+        old_ids = collection.get()['ids']
+        if old_ids:
+            collection.delete(ids=old_ids)
+        if contents:
+            collection.add(
+                documents=contents,
+                metadatas=[{"role": r, "time": t} for r, t in zip(roles, times)],
+                ids=ids
+            )
+    except Exception as e:
+        st.error("Failed to save chat history!\n\n" + traceback.format_exc())
 
 def clear_history():
-    collection.delete(ids=collection.get()['ids'])
+    try:
+        old_ids = collection.get()['ids']
+        if old_ids:
+            collection.delete(ids=old_ids)
+    except Exception as e:
+        st.error("Failed to clear chat history!\n\n" + traceback.format_exc())
 
-# ---- Streamlit UI setup ----
+# ---- Streamlit Page Setup ----
 st.set_page_config(page_title="ChatGPT-like Azure Chat", page_icon="💬", layout="wide")
 st.markdown("<style>textarea{font-size:1.1em;}</style>", unsafe_allow_html=True)
+st.title("💬 ChatGPT-like Azure Chat")
 
+# ---- Load messages into session_state ----
 if 'messages' not in st.session_state:
-    st.session_state.messages = load_history()
+    try:
+        st.session_state.messages = load_history()
+    except Exception as e:
+        st.session_state.messages = []
+        st.error("Failed to load messages at startup!\n\n" + traceback.format_exc())
 
+# ---- Styling ----
 st.markdown("""
     <style>
     .bubble-user {
@@ -86,18 +119,19 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-st.title("💬 ChatGPT-like Azure Chat")
+# ---- Chat Display ----
+try:
+    for msg in st.session_state.messages:
+        bubble = "bubble-user" if msg["role"] == "user" else "bubble-assistant"
+        time_str = msg.get("time", "")
+        st.markdown(
+            f"<div class='chat-row'><div class='{bubble}'>{msg['content']}<div class='bubble-time'>{time_str}</div></div></div>",
+            unsafe_allow_html=True
+        )
+except Exception as e:
+    st.error("Error displaying chat messages!\n\n" + traceback.format_exc())
 
-# ---- Chat history UI ----
-for msg in st.session_state.messages:
-    bubble = "bubble-user" if msg["role"] == "user" else "bubble-assistant"
-    time_str = msg.get("time", "")
-    st.markdown(
-        f"<div class='chat-row'><div class='{bubble}'>{msg['content']}<div class='bubble-time'>{time_str}</div></div></div>",
-        unsafe_allow_html=True
-    )
-
-# ---- Input box, auto-submit on Enter ----
+# ---- Input Form ----
 with st.form("chat-form", clear_on_submit=True):
     user_input = st.text_area(
         "Type your message...",
@@ -108,47 +142,55 @@ with st.form("chat-form", clear_on_submit=True):
     )
     send = st.form_submit_button("Send", use_container_width=True)
 
-# ---- Clear chat button ----
+# ---- Clear Chat Button ----
 col1, col2 = st.columns([9,1])
 with col2:
     if st.button("🗑️", help="Clear Chat"):
-        clear_history()
-        st.session_state.messages = []
-        st.experimental_rerun()
+        try:
+            clear_history()
+            st.session_state.messages = []
+            st.experimental_rerun()
+        except Exception as e:
+            st.error("Failed to clear chat!\n\n" + traceback.format_exc())
 
-# ---- Send/Respond Logic ----
+# ---- Message Sending Logic ----
 if send and user_input.strip():
-    now = datetime.datetime.now().strftime("%H:%M")
-    st.session_state.messages.append({
-        "role": "user",
-        "content": user_input,
-        "time": now
-    })
-    save_history(st.session_state.messages)
-    with st.spinner("Assistant is typing..."):
-        # --- Your existing Azure OpenAI call ---
-        ai_response = client.chat.completions.create(
-            model="gpt-4o",  # Change if you use another model name
-            messages=[{"role": msg["role"], "content": msg["content"]} for msg in st.session_state.messages],
-            max_tokens=500
-        )
-        response_content = ai_response.choices[0].message.content
-        now2 = datetime.datetime.now().strftime("%H:%M")
-    st.session_state.messages.append({
-        "role": "assistant",
-        "content": response_content,
-        "time": now2
-    })
-    save_history(st.session_state.messages)
-    st.experimental_rerun()
+    try:
+        now = datetime.datetime.now().strftime("%H:%M")
+        st.session_state.messages.append({
+            "role": "user",
+            "content": user_input,
+            "time": now
+        })
+        save_history(st.session_state.messages)
+        with st.spinner("Assistant is typing..."):
+            try:
+                ai_response = client.chat.completions.create(
+                    model="gpt-4o",  # Or your deployment name
+                    messages=[
+                        {"role": msg["role"], "content": msg["content"]}
+                        for msg in st.session_state.messages
+                    ],
+                    max_tokens=500
+                )
+                response_content = ai_response.choices[0].message.content
+                now2 = datetime.datetime.now().strftime("%H:%M")
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "content": response_content,
+                    "time": now2
+                })
+                save_history(st.session_state.messages)
+                st.experimental_rerun()
+            except Exception as e:
+                st.error("Azure OpenAI API call failed!\n\n" + traceback.format_exc())
+    except Exception as e:
+        st.error("Failed to send or save your message!\n\n" + traceback.format_exc())
 
-# ---- JS Auto-scroll to bottom ----
-st.markdown(
-    """
+# ---- Auto-scroll JS ----
+st.markdown("""
     <script>
     var chatDiv = window.parent.document.querySelector('section.main');
     if(chatDiv){ chatDiv.scrollTop = chatDiv.scrollHeight; }
     </script>
-    """,
-    unsafe_allow_html=True
-)
+""", unsafe_allow_html=True)
