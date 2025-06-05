@@ -11,7 +11,6 @@ DB_PATH = "chatgpt.sqlite"
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    # Table for chat threads
     cur.execute("""
         CREATE TABLE IF NOT EXISTS threads (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -19,7 +18,6 @@ def init_db():
             created TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    # Table for messages
     cur.execute("""
         CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -35,7 +33,6 @@ def init_db():
 
 init_db()
 
-# ---- Helper functions ----
 def list_threads():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -116,7 +113,6 @@ st.sidebar.title("💬 Chats")
 
 threads = list_threads()
 if 'current_thread_id' not in st.session_state:
-    # If no threads, create a default one
     if not threads:
         tid = create_thread("New Chat")
         st.session_state.current_thread_id = tid
@@ -124,7 +120,6 @@ if 'current_thread_id' not in st.session_state:
         st.session_state.current_thread_id = threads[0][0]
 
 # Select thread
-thread_names = [name for _, name in threads]
 thread_ids = [tid for tid, _ in threads]
 selected_idx = 0
 if st.session_state.current_thread_id in thread_ids:
@@ -143,13 +138,25 @@ with col1:
     if st.button("➕", help="New Chat"):
         new_id = create_thread("New Chat")
         st.session_state.current_thread_id = new_id
-        st.experimental_rerun()
+        st.rerun()
 with col2:
+    # --- Rename logic ---
+    if "rename_mode" not in st.session_state:
+        st.session_state.rename_mode = False
     if st.button("✏️", help="Rename"):
-        new_name = st.text_input("Rename Chat", value=[name for i, name in threads if i == st.session_state.current_thread_id][0], key="renamebox")
+        st.session_state.rename_mode = not st.session_state.rename_mode
+        st.rerun()
+    if st.session_state.rename_mode:
+        current_name = [name for i, name in threads if i == st.session_state.current_thread_id][0]
+        new_title = st.text_input("Enter new chat name:", value=current_name, key="renamebox")
         if st.button("Save", key="saverename"):
-            rename_thread(st.session_state.current_thread_id, new_name)
-            st.experimental_rerun()
+            if new_title.strip():
+                rename_thread(st.session_state.current_thread_id, new_title.strip())
+            st.session_state.rename_mode = False
+            st.rerun()
+        if st.button("Cancel", key="cancelrename"):
+            st.session_state.rename_mode = False
+            st.rerun()
 with col3:
     if st.button("🗑️", help="Delete"):
         delete_thread(st.session_state.current_thread_id)
@@ -158,7 +165,7 @@ with col3:
             st.session_state.current_thread_id = threads[0][0]
         else:
             st.session_state.current_thread_id = create_thread("New Chat")
-        st.experimental_rerun()
+        st.rerun()
 
 st.sidebar.markdown("---")
 st.sidebar.write("Click 'New Chat' to start a new conversation.")
@@ -195,18 +202,16 @@ with st.form("chat-form", clear_on_submit=True):
 
 if st.button("🧹 Clear Chat History", key="clearchat"):
     clear_thread(st.session_state.current_thread_id)
-    st.experimental_rerun()
+    st.rerun()
 
 if send and user_input.strip():
     now = datetime.datetime.now().strftime("%H:%M")
     save_message(st.session_state.current_thread_id, "user", user_input, now)
-    st.experimental_rerun()
+    st.rerun()
     # After rerun, below code sends to Azure OpenAI and saves response
 
-# Get latest messages after any new user message
 messages = get_messages(st.session_state.current_thread_id)
 
-# If last message is user and not yet answered by assistant, call API
 if messages and messages[-1]['role'] == 'user' and (len(messages) == 1 or messages[-2]['role'] == 'assistant' or len(messages)==1):
     with st.spinner("Assistant is typing..."):
         try:
@@ -220,11 +225,10 @@ if messages and messages[-1]['role'] == 'user' and (len(messages) == 1 or messag
             response_content = ai_response.choices[0].message.content
             now2 = datetime.datetime.now().strftime("%H:%M")
             save_message(st.session_state.current_thread_id, "assistant", response_content, now2)
-            st.experimental_rerun()
+            st.rerun()
         except Exception as e:
             st.error("Azure OpenAI API call failed!\n\n" + str(e))
 
-# --- Tiny JS for auto-scroll
 st.markdown("""
     <script>
     var chatDiv = window.parent.document.querySelector('section.main');
