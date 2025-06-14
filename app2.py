@@ -1,14 +1,13 @@
 import streamlit as st
 import os
 import uuid
-import tempfile
 from services.openai_chat import chat_completion
 from services.file_processing import extract_text
 from db.db import init_db, add_chat, add_message, get_chat_history, list_chats, add_file
 from dotenv import load_dotenv
 import datetime
 
-# For audio input with streamlit-webrtc
+# For audio input with streamlit-webrtc (legacy version, minimal args)
 from streamlit_webrtc import webrtc_streamer, AudioProcessorBase
 import av
 import numpy as np
@@ -86,7 +85,7 @@ for msg in chat_history:
     else:
         st.markdown(f"`{msg['content']}`")
 
-# --- Voice input (mic) using streamlit-webrtc (NO client_settings argument)
+# --- Voice input (mic) using streamlit-webrtc (NO mode arg, minimal args only)
 st.write("Type your question or use your microphone below:")
 
 class AudioProcessor(AudioProcessorBase):
@@ -112,7 +111,6 @@ class AudioProcessor(AudioProcessorBase):
 
 audio_ctx = webrtc_streamer(
     key="speech-to-text",
-    mode="SENDONLY",    # just use plain string
     audio_receiver_size=256,
     async_processing=False,
     audio_processor_factory=AudioProcessor,
