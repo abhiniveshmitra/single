@@ -1,237 +1,142 @@
 import streamlit as st
-import datetime
 import os
-import sqlite3
+import uuid
+import tempfile
+from services.openai_chat import chat_completion
+from services.file_processing import extract_text
+from db.db import init_db, add_chat, add_message, get_chat_history, list_chats, add_file
 from dotenv import load_dotenv
-import traceback
+import datetime
 
-# ---- SQLite Setup ----
-DB_PATH = "chatgpt.sqlite"
+# For audio input with streamlit-webrtc
+from streamlit_webrtc import webrtc_streamer, AudioProcessorBase
+import av
+import numpy as np
+import io
+import wave
 
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS threads (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            created TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            thread_id INTEGER,
-            role TEXT,
-            content TEXT,
-            time TEXT,
-            FOREIGN KEY(thread_id) REFERENCES threads(id)
-        )
-    """)
-    conn.commit()
-    conn.close()
-
+load_dotenv()
 init_db()
 
-def list_threads():
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT id, name FROM threads ORDER BY created DESC")
-    threads = cur.fetchall()
-    conn.close()
-    return threads
+st.set_page_config(page_title="Multimodal Enterprise Q&A Copilot", layout="wide")
+st.title("🧑‍💼 Multimodal Enterprise File Q&A Copilot")
 
-def create_thread(name):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("INSERT INTO threads (name) VALUES (?)", (name,))
-    thread_id = cur.lastrowid
-    conn.commit()
-    conn.close()
-    return thread_id
+# --- Sidebar: select or create chat session
+with st.sidebar:
+    st.header("💬 Chats")
+    chats = list_chats()
+    chat_titles = [c["title"] for c in chats]
+    if "active_chat" not in st.session_state or st.session_state.active_chat not in chat_titles:
+        st.session_state.active_chat = chat_titles[0] if chat_titles else None
 
-def rename_thread(thread_id, new_name):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("UPDATE threads SET name=? WHERE id=?", (new_name, thread_id))
-    conn.commit()
-    conn.close()
+    chat_idx = st.selectbox(
+        "Select chat", 
+        options=chat_titles, 
+        index=0 if not chats else chat_titles.index(st.session_state.active_chat) if st.session_state.active_chat else 0
+    ) if chat_titles else None
+    st.session_state.active_chat = chat_idx
 
-def delete_thread(thread_id):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("DELETE FROM messages WHERE thread_id=?", (thread_id,))
-    cur.execute("DELETE FROM threads WHERE id=?", (thread_id,))
-    conn.commit()
-    conn.close()
+    if st.button("➕ New Chat"):
+        chat_id = str(uuid.uuid4())[:8]
+        title = f"Chat-{chat_id}"
+        add_chat(chat_id, title)
+        st.session_state.active_chat = title
+        st.rerun()
 
-def save_message(thread_id, role, content, time):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO messages (thread_id, role, content, time) VALUES (?, ?, ?, ?)",
-        (thread_id, role, content, time)
-    )
-    conn.commit()
-    conn.close()
+chat_title = st.session_state.active_chat
+chat = next((c for c in chats if c["title"] == chat_title), None)
+chat_id = chat["id"] if chat else None
 
-def get_messages(thread_id):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT role, content, time FROM messages WHERE thread_id=? ORDER BY id",
-        (thread_id,)
-    )
-    msgs = cur.fetchall()
-    conn.close()
-    return [{"role": r, "content": c, "time": t} for r, c, t in msgs]
+if not chat_id:
+    st.warning("Please select or create a chat.")
+    st.stop()
 
-def clear_thread(thread_id):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("DELETE FROM messages WHERE thread_id=?", (thread_id,))
-    conn.commit()
-    conn.close()
+chat_history = get_chat_history(chat_id)
 
-# ---- Azure OpenAI Setup ----
-load_dotenv()
-AZURE_OPENAI_KEY = os.getenv("AZURE_OPENAI_KEY")
-AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
-from openai import AzureOpenAI
+st.subheader(chat_title)
+st.write("Upload PDF, TXT, or type/speak your question.")
 
-client = AzureOpenAI(
-    api_key=AZURE_OPENAI_KEY,
-    azure_endpoint=AZURE_OPENAI_ENDPOINT,
-    api_version="2025-01-01-preview"
+# --- File uploader (PDF, TXT, Images)
+uploaded_file = st.file_uploader(
+    "Upload document (PDF/TXT/JPG/PNG)", 
+    type=["pdf", "txt", "jpg", "jpeg", "png"], 
+    key="fileup"
 )
-
-# ---- Streamlit App ----
-st.set_page_config(page_title="ChatGPT-like Azure Chat", page_icon="💬", layout="wide")
-
-# --- Sidebar: Thread/Chat selection
-st.sidebar.title("💬 Chats")
-
-threads = list_threads()
-if 'current_thread_id' not in st.session_state:
-    if not threads:
-        tid = create_thread("New Chat")
-        st.session_state.current_thread_id = tid
+if uploaded_file:
+    text = extract_text(uploaded_file, uploaded_file.name)
+    if not text:
+        st.error("Could not extract text from file.")
     else:
-        st.session_state.current_thread_id = threads[0][0]
+        # Save file to disk
+        storage_dir = os.path.join("storage", chat_id)
+        os.makedirs(storage_dir, exist_ok=True)
+        file_path = os.path.join(storage_dir, uploaded_file.name)
+        with open(file_path, "wb") as f:
+            f.write(uploaded_file.getbuffer())
+        add_file(chat_id, uploaded_file.name, file_path, uploaded_file.type)
+        add_message(chat_id, "system", f"[File uploaded: {uploaded_file.name}]\n{text[:1000]}...")
+        st.success(f"File '{uploaded_file.name}' processed and saved.")
 
-# Select thread
-thread_ids = [tid for tid, _ in threads]
-selected_idx = 0
-if st.session_state.current_thread_id in thread_ids:
-    selected_idx = thread_ids.index(st.session_state.current_thread_id)
-selected = st.sidebar.radio(
-    "Conversations",
-    options=thread_ids,
-    format_func=lambda tid: [name for i, name in threads if i == tid][0],
-    index=selected_idx
+# --- Display chat history
+for msg in chat_history:
+    if msg["role"] == "user":
+        st.markdown(f"**You:** {msg['content']}")
+    elif msg["role"] == "assistant":
+        st.markdown(f"**Copilot:** {msg['content']}")
+    else:
+        st.markdown(f"`{msg['content']}`")
+
+# --- Voice input (mic) using streamlit-webrtc (NO client_settings argument)
+st.write("Type your question or use your microphone below:")
+
+class AudioProcessor(AudioProcessorBase):
+    def __init__(self):
+        self.recorded_frames = []
+
+    def recv(self, frame):
+        audio = frame.to_ndarray()
+        self.recorded_frames.append(audio)
+        return frame
+
+    def get_wav_bytes(self):
+        if not self.recorded_frames:
+            return None
+        pcm_audio = np.concatenate(self.recorded_frames)
+        wav_buf = io.BytesIO()
+        with wave.open(wav_buf, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)  # 16-bit audio
+            wf.setframerate(16000)
+            wf.writeframes(pcm_audio.tobytes())
+        return wav_buf.getvalue()
+
+audio_ctx = webrtc_streamer(
+    key="speech-to-text",
+    mode="SENDONLY",
+    audio_receiver_size=256,
+    async_processing=False,
+    audio_processor_factory=AudioProcessor,
 )
-st.session_state.current_thread_id = selected
 
-# --- Sidebar controls
-col1, col2, col3 = st.sidebar.columns(3)
-with col1:
-    if st.button("➕", help="New Chat"):
-        new_id = create_thread("New Chat")
-        st.session_state.current_thread_id = new_id
-        st.rerun()
-with col2:
-    # --- Rename logic ---
-    if "rename_mode" not in st.session_state:
-        st.session_state.rename_mode = False
-    if st.button("✏️", help="Rename"):
-        st.session_state.rename_mode = not st.session_state.rename_mode
-        st.rerun()
-    if st.session_state.rename_mode:
-        current_name = [name for i, name in threads if i == st.session_state.current_thread_id][0]
-        new_title = st.text_input("Enter new chat name:", value=current_name, key="renamebox")
-        if st.button("Save", key="saverename"):
-            if new_title.strip():
-                rename_thread(st.session_state.current_thread_id, new_title.strip())
-            st.session_state.rename_mode = False
+# Store/handle audio for transcription
+if audio_ctx and audio_ctx.audio_processor:
+    if st.button("Transcribe Last Recording"):
+        wav_bytes = audio_ctx.audio_processor.get_wav_bytes()
+        if wav_bytes:
+            from services.speech import speech_to_text
+            transcript = speech_to_text(wav_bytes)
+            add_message(chat_id, "user", transcript)
+            st.success(f"Transcribed: {transcript}")
             st.rerun()
-        if st.button("Cancel", key="cancelrename"):
-            st.session_state.rename_mode = False
-            st.rerun()
-with col3:
-    if st.button("🗑️", help="Delete"):
-        delete_thread(st.session_state.current_thread_id)
-        threads = list_threads()
-        if threads:
-            st.session_state.current_thread_id = threads[0][0]
         else:
-            st.session_state.current_thread_id = create_thread("New Chat")
-        st.rerun()
+            st.info("No audio captured yet. Press the mic, speak, then press 'Transcribe Last Recording'.")
 
-st.sidebar.markdown("---")
-st.sidebar.write("Click 'New Chat' to start a new conversation.")
-
-# --- Main Chat area
-st.title("💬 ChatGPT-like Azure Chat")
-
-messages = get_messages(st.session_state.current_thread_id)
-
-for msg in messages:
-    bubble = "bubble-user" if msg["role"] == "user" else "bubble-assistant"
-    st.markdown(
-        f"""
-        <div style="background-color: {'#0078fe' if msg['role']=='user' else '#f4f4f8'};
-                    color: {'white' if msg['role']=='user' else '#222'};
-                    border-radius:1em; padding:12px 18px; margin-bottom:8px; max-width:70%; float:{'right' if msg['role']=='user' else 'left'}; box-shadow:0 2px 8px rgba(0,0,0,0.04); clear:both;">
-        {msg['content']}
-        <div style="font-size:0.75em;color:#888;margin-top:2px;">{msg['time']}</div>
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
-
-# --- Input area
-with st.form("chat-form", clear_on_submit=True):
-    user_input = st.text_area(
-        "Type your message...",
-        key="user_input",
-        label_visibility="collapsed",
-        height=80,
-        max_chars=500
-    )
-    send = st.form_submit_button("Send", use_container_width=True)
-
-if st.button("🧹 Clear Chat History", key="clearchat"):
-    clear_thread(st.session_state.current_thread_id)
+# --- Send user message (text box)
+user_input = st.text_input("Your question:", key="chatbox")
+if st.button("Send") and user_input.strip():
+    add_message(chat_id, "user", user_input)
+    # Get full chat history (system/user/assistant messages only)
+    messages = [{"role": m["role"], "content": m["content"]} for m in get_chat_history(chat_id)]
+    response = chat_completion(messages)
+    add_message(chat_id, "assistant", response)
     st.rerun()
-
-if send and user_input.strip():
-    now = datetime.datetime.now().strftime("%H:%M")
-    save_message(st.session_state.current_thread_id, "user", user_input, now)
-    st.rerun()
-    # After rerun, below code sends to Azure OpenAI and saves response
-
-messages = get_messages(st.session_state.current_thread_id)
-
-if messages and messages[-1]['role'] == 'user' and (len(messages) == 1 or messages[-2]['role'] == 'assistant' or len(messages)==1):
-    with st.spinner("Assistant is typing..."):
-        try:
-            ai_response = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": m["role"], "content": m["content"]} for m in messages
-                ],
-                max_tokens=500
-            )
-            response_content = ai_response.choices[0].message.content
-            now2 = datetime.datetime.now().strftime("%H:%M")
-            save_message(st.session_state.current_thread_id, "assistant", response_content, now2)
-            st.rerun()
-        except Exception as e:
-            st.error("Azure OpenAI API call failed!\n\n" + str(e))
-
-st.markdown("""
-    <script>
-    var chatDiv = window.parent.document.querySelector('section.main');
-    if(chatDiv){ chatDiv.scrollTop = chatDiv.scrollHeight; }
-    </script>
-""", unsafe_allow_html=True)
