@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 import datetime
 
 # For audio input with streamlit-webrtc
-from streamlit_webrtc import webrtc_streamer, AudioProcessorBase
+from streamlit_webrtc import webrtc_streamer, AudioProcessorBase, Mode
 import av
 import numpy as np
 import io
@@ -112,7 +112,7 @@ class AudioProcessor(AudioProcessorBase):
 
 audio_ctx = webrtc_streamer(
     key="speech-to-text",
-    mode="SENDONLY",
+    mode=Mode.SENDONLY,  # FIXED: use Mode.SENDONLY not "SENDONLY"
     audio_receiver_size=256,
     async_processing=False,
     audio_processor_factory=AudioProcessor,
