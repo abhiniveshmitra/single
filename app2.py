@@ -1,99 +1,117 @@
-# src/document_processor.py
+# src/azure_services.py
 
 import os
-import uuid
-import time
 import streamlit as st
-from azure.core.credentials import AzureKeyCredential
-from azure.core.exceptions import HttpResponseError
-from azure.ai.documentintelligence import DocumentIntelligenceClient
-from azure.search.documents import SearchClient
+from openai import AzureOpenAI
+import azure.cognitiveservices.speech as speechsdk
+from langchain_community.vectorstores import Chroma
+from langchain_openai import AzureOpenAIEmbeddings
 
-def table_to_markdown(table):
-    """Converts a DocumentIntelligence table object to a Markdown string for better searchability."""
-    md_string = ""
-    header_cells = [cell.content for cell in table.cells if cell.row_index == 0]
-    md_string += "| " + " | ".join(header_cells) + " |\n"
-    md_string += "| " + " | ".join(["---"] * len(header_cells)) + " |\n"
-    for row_idx in range(1, table.row_count):
-        row_cells = []
-        for col_idx in range(table.column_count):
-            cell_found = False
-            for cell in table.cells:
-                if cell.row_index == row_idx and cell.column_index == col_idx:
-                    sanitized_content = cell.content.replace("\n", " ").replace("|", "\|")
-                    row_cells.append(sanitized_content)
-                    cell_found = True
-                    break
-            if not cell_found:
-                row_cells.append("") 
-        md_string += "| " + " | ".join(row_cells) + " |\n"
-    return md_string
+# Define the path for the persistent local vector database.
+CHROMA_PATH = "chroma_db"
 
-def process_and_index_document(uploaded_file, search_client: SearchClient):
+# --- Client Initialization ---
+
+@st.cache_resource
+def get_azure_openai_client():
+    """Initializes and returns a cached AzureOpenAI client."""
+    return AzureOpenAI(
+        api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+        api_version="2024-05-01-preview",
+        azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT")
+    )
+
+@st.cache_resource
+def get_speech_config():
+    """Initializes and returns a cached Azure Speech service configuration."""
+    return speechsdk.SpeechConfig(
+        subscription=os.getenv("SPEECH_KEY"),
+        region=os.getenv("SPEECH_REGION")
+    )
+
+# --- NEW: Function to load an existing ChromaDB collection ---
+
+def load_chroma_collection(collection_name: str):
     """
-    Orchestrates the process of analyzing a document and indexing its content
-    into Azure AI Search using a robust, batched upload strategy.
+    Loads an existing ChromaDB collection from disk. This allows the app to
+    persist the document context across reruns within the same session.
     """
-    doc_intel_endpoint = os.getenv("DOCUMENT_INTELLIGENCE_ENDPOINT")
-    doc_intel_key = os.getenv("DOCUMENT_INTELLIGENCE_KEY")
-
-    if not all([doc_intel_endpoint, doc_intel_key]):
-        st.error("Document Intelligence credentials are not configured in .env file.")
-        return False
-
-    with st.spinner(f"Analyzing document '{uploaded_file.name}'..."):
-        file_bytes = uploaded_file.read()
-        try:
-            document_intelligence_client = DocumentIntelligenceClient(
-                endpoint=doc_intel_endpoint, credential=AzureKeyCredential(doc_intel_key)
-            )
-            poller = document_intelligence_client.begin_analyze_document(
-                "prebuilt-layout", file_bytes, content_type="application/octet-stream"
-            )
-            result = poller.result()
-            st.success("✅ Document analysis complete.")
-        except Exception as e:
-            st.error(f"Error during document analysis. This could be a network issue, a credential problem, or an invalid document format. Details: {e}")
-            return False
-
-    with st.spinner("Preparing and indexing content..."):
-        documents_to_upload = []
-        if result.paragraphs:
-            for para in result.paragraphs:
-                documents_to_upload.append({
-                    "id": str(uuid.uuid4()), "content": para.content, "source_filename": uploaded_file.name,
-                    "page_number": para.bounding_regions[0].page_number if para.bounding_regions else 1, "chunk_type": "paragraph"
-                })
-        if result.tables:
-            for table in result.tables:
-                documents_to_upload.append({
-                    "id": str(uuid.uuid4()), "content": table_to_markdown(table), "source_filename": uploaded_file.name,
-                    "page_number": table.bounding_regions[0].page_number if table.bounding_regions else 1, "chunk_type": "table"
-                })
+    try:
+        # Initialize the embeddings model, which is needed to interact with the collection.
+        embeddings_model = AzureOpenAIEmbeddings(
+            azure_deployment=os.getenv("ADA_DEPLOYMENT_NAME"),
+            openai_api_version="2024-05-01-preview",
+        )
         
-        if not documents_to_upload:
-            st.warning("⚠️ No content could be extracted from the document.")
-            return False
+        # Load the persistent database from disk
+        db = Chroma(
+            persist_directory=CHROMA_PATH, 
+            embedding_function=embeddings_model,
+            collection_name=collection_name
+        )
+        return db
+    except Exception as e:
+        # This can happen if the collection directory doesn't exist yet.
+        st.info(f"Chroma collection '{collection_name}' not found. It will be created when a document is processed.")
+        return None
 
-        # --- THE RADICAL CHANGE: BATCHING THE UPLOAD ---
-        # Instead of one large upload, we send the data in smaller, more reliable chunks.
-        batch_size = 50  # A safe batch size
-        total_chunks = len(documents_to_upload)
-        
-        progress_bar = st.progress(0, text=f"Indexing 0/{total_chunks} chunks...")
+# --- Modified OpenAI Service ---
 
-        for i in range(0, total_chunks, batch_size):
-            batch = documents_to_upload[i:i + batch_size]
-            try:
-                search_client.upload_documents(documents=batch)
-                progress_bar.progress((i + len(batch)) / total_chunks, text=f"Indexing {i + len(batch)}/{total_chunks} chunks...")
-                time.sleep(0.5) # A small delay can also help with very strict firewalls
-            except Exception as e:
-                st.error(f"Error indexing batch starting at chunk {i}. This is likely a persistent network/firewall issue. Please contact your IT support. Details: {e}")
-                progress_bar.empty()
-                return False
-        
-        progress_bar.empty()
-        st.success(f"✅ Successfully indexed all {total_chunks} chunks. The document is now ready for Q&A.")
-        return True
+def get_chat_completion(messages_from_ui, vector_store: Chroma, image_data=None):
+    """
+    Generates a chat response, using a local ChromaDB vector store for context.
+    Your expertise in building these search systems is reflected in this robust implementation[1].
+    """
+    client = get_azure_openai_client()
+    
+    # --- Dynamic System Prompt Logic ---
+    context = ""
+    # Check if a vector store is available and has been passed.
+    if vector_store:
+        last_user_message = messages_from_ui[-1]['content']
+        # Perform a similarity search on the local ChromaDB to find relevant context[5].
+        results = vector_store.similarity_search(last_user_message, k=4)
+        if results:
+            context = "\n\n".join([doc.page_content for doc in results])
+
+    if context:
+        # If we found relevant context, instruct the bot to be a document expert.
+        system_prompt = (
+            "You are an expert AI assistant for document analysis. Answer the user's questions based ONLY on the provided context from the document. "
+            "If the answer is not in the context, clearly state that the document does not contain the answer. "
+            "Do not use any outside knowledge."
+        )
+        system_prompt += f"\n\n--- CONTEXT FROM DOCUMENT ---\n{context}\n--- END OF CONTEXT ---"
+    else:
+        # If no context was found, instruct the bot to be a general-purpose assistant.
+        system_prompt = (
+            "You are a helpful AI assistant. Answer the user's question to the best of your ability. "
+            "If you are asked about a specific document, inform the user that no document has been processed "
+            "or no relevant information was found."
+        )
+
+    # Prepare the messages for the API call
+    api_messages = [{"role": "system", "content": system_prompt}] + \
+                   [{"role": msg["role"], "content": msg["content"]} for msg in messages_from_ui]
+    
+    # The pattern of using Azure OpenAI embeddings for document search is well-established[3][4].
+    try:
+        return client.chat.completions.create(
+            model=os.getenv("GPT4_DEPLOYMENT_NAME"),
+            messages=api_messages,
+            stream=True,
+            temperature=0.7 # A balanced temperature for both factual and general conversation
+        )
+    except Exception as e:
+        st.error(f"Error connecting to Azure OpenAI: {e}")
+        # Return an empty iterator to prevent the app from crashing on network errors
+        return iter([])
+
+# --- Speech and Other Services (Remain unchanged) ---
+
+def synthesize_text_to_speech(text):
+    """Generates speech from text using Azure Speech Services."""
+    speech_config = get_speech_config()
+    synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=None)
+    result = synthesizer.speak_text_async(text).get()
+    return result.audio_data if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted else None
