@@ -1,68 +1,3 @@
-# src/document_processor.py
-
-import os
-import streamlit as st
-from azure.core.credentials import AzureKeyCredential
-from azure.ai.documentintelligence import DocumentIntelligenceClient
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import Chroma
-from langchain_huggingface import HuggingFaceEmbeddings  # NEW IMPORT
-
-CHROMA_PATH = "chroma_db"
-LOCAL_EMBEDDING_MODEL = "all-MiniLM-L6-v2" # A fast, effective local model
-
-def process_and_index_document(uploaded_file, collection_name: str):
-    """
-    Analyzes a document, then chunks and embeds its content using a
-    100% local model, storing it in ChromaDB.
-    """
-    # ... (Document Intelligence analysis part remains the same) ...
-    doc_intel_endpoint = os.getenv("DOCUMENT_INTELLIGENCE_ENDPOINT")
-    doc_intel_key = os.getenv("DOCUMENT_INTELLIGENCE_KEY")
-
-    with st.spinner(f"Analyzing document '{uploaded_file.name}'..."):
-        try:
-            document_intelligence_client = DocumentIntelligenceClient(
-                endpoint=doc_intel_endpoint, credential=AzureKeyCredential(doc_intel_key)
-            )
-            file_bytes = uploaded_file.read()
-            poller = document_intelligence_client.begin_analyze_document(
-                "prebuilt-layout", file_bytes, content_type="application/octet-stream"
-            )
-            result = poller.result()
-        except Exception as e:
-            st.error(f"Error during document analysis: {e}")
-            return None
-
-    full_content = ""
-    if result.paragraphs:
-        for para in result.paragraphs:
-            full_content += para.content + "\n"
-    if not full_content:
-        st.warning("⚠️ No text content extracted.")
-        return None
-
-    with st.spinner("Preparing content for local embedding..."):
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-        chunks = text_splitter.split_text(text=full_content)
-
-    # --- THE RADICAL CHANGE: LOCAL EMBEDDINGS ---
-    with st.spinner("Creating embeddings locally... (First time may download the model)"):
-        try:
-            # This uses the Sentence-Transformers library to run the model on your machine's CPU.
-            embeddings_model = HuggingFaceEmbeddings(model_name=LOCAL_EMBEDDING_MODEL)
-            
-            db = Chroma.from_texts(
-                texts=chunks, 
-                embedding=embeddings_model,
-                collection_name=collection_name,
-                persist_directory=CHROMA_PATH
-            )
-            st.success("✅ Document successfully indexed using local embeddings.")
-            return db
-        except Exception as e:
-            st.error(f"Error creating local vector store: {e}")
-            return None
 # src/azure_services.py
 
 import os
@@ -174,4 +109,3 @@ def synthesize_text_to_speech(text):
     synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=None)
     result = synthesizer.speak_text_async(text).get()
     return result.audio_data if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted else None
-
