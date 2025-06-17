@@ -1,20 +1,19 @@
 # src/document_processor.py
 
 import os
-import uuid
 import streamlit as st
 from azure.core.credentials import AzureKeyCredential
 from azure.ai.documentintelligence import DocumentIntelligenceClient
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
-from light_embed.embedding import Embedding # THE DEFINITIVE FIX: Correct import statement
+from langchain_openai import AzureOpenAIEmbeddings # THE CORRECT IMPORT
 
 CHROMA_PATH = "chroma_db"
 
 def process_and_index_document(uploaded_file, collection_name: str):
     """
-    Analyzes a document, then chunks and embeds its content using the
-    lightweight and dependency-free LightEmbed library.
+    Analyzes a document, chunks it, creates embeddings using Azure OpenAI's
+    ada-002 model, and stores them in a local ChromaDB.
     """
     # --- Document Intelligence analysis part remains the same ---
     doc_intel_endpoint = os.getenv("DOCUMENT_INTELLIGENCE_ENDPOINT")
@@ -43,32 +42,29 @@ def process_and_index_document(uploaded_file, collection_name: str):
         return None
 
     # --- Text Splitting remains the same ---
-    with st.spinner("Preparing content for local embedding..."):
+    with st.spinner("Preparing content for embedding..."):
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
         chunks = text_splitter.split_text(text=full_content)
-        chunk_ids = [str(uuid.uuid4()) for _ in chunks]
 
-    # --- Using LightEmbed with the correct class name ---
-    with st.spinner("Creating embeddings locally with LightEmbed..."):
+    # --- THE RADICAL CHANGE: USING AZURE OPENAI EMBEDDINGS ---
+    with st.spinner("Creating embeddings via Azure OpenAI... This may take a moment."):
         try:
-            # THE DEFINITIVE FIX: Instantiate the correct 'Embedding' class
-            embedding_model = Embedding()
+            # This uses your deployed ada-002 model[7].
+            embeddings_model = AzureOpenAIEmbeddings(
+                azure_deployment=os.getenv("ADA_DEPLOYMENT_NAME"),
+                openai_api_version="2024-05-01-preview",
+            )
             
-            vectors = embedding_model.embed(chunks)
-
-            db = Chroma(
+            db = Chroma.from_texts(
+                texts=chunks, 
+                embedding=embeddings_model,
                 collection_name=collection_name,
                 persist_directory=CHROMA_PATH
             )
-            db.add_embeddings(
-                ids=chunk_ids,
-                embeddings=vectors,
-                documents=chunks
-            )
-            st.success("✅ Document successfully indexed using local LightEmbed engine.")
+            st.success("✅ Document successfully indexed using Azure OpenAI embeddings.")
             return db
         except Exception as e:
-            st.error(f"Error creating local vector store with LightEmbed: {e}")
+            st.error(f"Error creating vector store. Check your Azure OpenAI credentials and network. Details: {e}")
             return None
 # src/azure_services.py
 
@@ -77,11 +73,11 @@ import streamlit as st
 from openai import AzureOpenAI
 import azure.cognitiveservices.speech as speechsdk
 from langchain_community.vectorstores import Chroma
-from light_embed.embedding import Embedding # THE DEFINITIVE FIX: Correct import statement
+from langchain_openai import AzureOpenAIEmbeddings # THE CORRECT IMPORT
 
 CHROMA_PATH = "chroma_db"
 
-# --- Client Initialization and Model Caching ---
+# --- Client Initialization ---
 @st.cache_resource
 def get_azure_openai_client():
     return AzureOpenAI(
@@ -97,18 +93,18 @@ def get_speech_config():
         region=os.getenv("SPEECH_REGION")
     )
 
-@st.cache_resource
-def get_embedding_model():
-    """Loads the LightEmbed model once and caches it."""
-    # THE DEFINITIVE FIX: Instantiate the correct 'Embedding' class
-    return Embedding()
-
-# --- Function to Load ChromaDB ---
+# --- Function to Load ChromaDB using AZURE OPENAI embeddings ---
 def load_chroma_collection(collection_name: str):
-    """Loads an existing ChromaDB collection from disk."""
+    """Loads an existing ChromaDB collection using the Azure OpenAI embedding model."""
     try:
+        embeddings_model = AzureOpenAIEmbeddings(
+            azure_deployment=os.getenv("ADA_DEPLOYMENT_NAME"),
+            openai_api_version="2024-05-01-preview",
+        )
+        
         db = Chroma(
             persist_directory=CHROMA_PATH, 
+            embedding_function=embeddings_model,
             collection_name=collection_name
         )
         return db
@@ -116,17 +112,15 @@ def load_chroma_collection(collection_name: str):
         st.info(f"Chroma collection '{collection_name}' not found. It will be created when a document is processed.")
         return None
 
-# --- Chat Completion Function (Refactored for manual query embedding) ---
+# --- Chat Completion Function (Simplified for LangChain) ---
 def get_chat_completion(messages_from_ui, vector_store: Chroma, image_data=None):
     client = get_azure_openai_client()
     context = ""
     if vector_store:
         last_user_message = messages_from_ui[-1]['content']
         
-        embedding_model = get_embedding_model()
-        query_vector = embedding_model.embed(last_user_message)[0]
-        
-        results = vector_store.similarity_search_by_vector(embedding=query_vector, k=4)
+        # LangChain handles embedding the query for us when we use similarity_search
+        results = vector_store.similarity_search(last_user_message, k=4)
         
         if results:
             context = "\n\n".join([doc.page_content for doc in results])
@@ -143,6 +137,7 @@ def get_chat_completion(messages_from_ui, vector_store: Chroma, image_data=None)
             "If asked about a document, say that no document has been processed or no relevant information was found."
         )
     
+    # This chat system uses the power of GPT-4.1[8]
     api_messages = [{"role": "system", "content": system_prompt}] + \
                    [{"role": msg["role"], "content": msg["content"]} for msg in messages_from_ui]
     
@@ -159,6 +154,7 @@ def get_chat_completion(messages_from_ui, vector_store: Chroma, image_data=None)
 
 # --- Speech Services (No changes) ---
 def synthesize_text_to_speech(text):
+    # This function, leveraging your experience with text-to-speech[9], remains unchanged.
     speech_config = get_speech_config()
     synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=None)
     result = synthesizer.speak_text_async(text).get()
