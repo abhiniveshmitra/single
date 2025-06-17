@@ -30,7 +30,7 @@ def table_to_markdown(table):
 def process_and_index_document(uploaded_file, search_client: SearchClient):
     """
     Orchestrates the process of analyzing a document with Document Intelligence
-    and indexing its content into Azure AI Search.
+    and indexing its content into Azure AI Search, with robust error handling.
     """
     doc_intel_endpoint = os.getenv("DOCUMENT_INTELLIGENCE_ENDPOINT")
     doc_intel_key = os.getenv("DOCUMENT_INTELLIGENCE_KEY")
@@ -46,15 +46,15 @@ def process_and_index_document(uploaded_file, search_client: SearchClient):
             endpoint=doc_intel_endpoint, credential=AzureKeyCredential(doc_intel_key)
         )
         
-        # --- FIX: Pass the uploaded file content using the 'analyze_request' keyword argument. ---
-        # This resolves the "missing 1 required positional argument: 'body'" error.
+        # FIX #1: Correctly use the 'analyze_request' keyword argument to pass the file bytes.
         poller = document_intelligence_client.begin_analyze_document(
             "prebuilt-layout", analyze_request=uploaded_file.read(), content_type="application/octet-stream"
         )
         result = poller.result()
         st.success("Document analysis complete.")
     except Exception as e:
-        st.error(f"Error during document analysis: {e}")
+        # FIX #2: Catch any error (including network/EOF errors) and show a clean message.
+        st.error(f"Error during document analysis. This could be a network issue or an invalid document format. Details: {e}")
         return False
 
     st.info("Preparing content for search index...")
@@ -86,11 +86,12 @@ def process_and_index_document(uploaded_file, search_client: SearchClient):
 
     st.info(f"Indexing {len(documents_to_upload)} chunks into Azure AI Search...")
     try:
+        # FIX #2 (cont.): Add error handling for the search upload process as well.
         search_client.upload_documents(documents=documents_to_upload)
         st.success("Document successfully indexed and is now searchable.")
         return True
     except Exception as e:
-        st.error(f"Error indexing documents: {e}")
+        st.error(f"Error indexing documents. This could be a network issue (like an EOF error) or an index configuration problem. Details: {e}")
         return False
 # src/azure_services.py
 
@@ -133,11 +134,12 @@ def get_speech_config():
         region=os.getenv("SPEECH_REGION")
     )
 
-# --- Azure AI Search Querying ---
+# --- Azure AI Search Querying with Error Handling ---
 def get_context_from_azure_search(query: str, search_client: SearchClient):
-    """Performs a hybrid search and returns the context. Returns an empty string if no results."""
+    """Performs a hybrid search and returns the context. Handles network errors gracefully."""
     vector_query = VectorizedQuery(vector=[], k_nearest_neighbors=3, fields="content_vector")
     try:
+        # FIX #2 (cont.): Wrap the search call in a try...except block.
         results = search_client.search(
             search_text=query,
             vector_queries=[vector_query],
@@ -150,19 +152,18 @@ def get_context_from_azure_search(query: str, search_client: SearchClient):
             context += f"\n[SOURCE: file '{result['source_filename']}', page {result['page_number']}]\n{result['content']}\n"
         return context
     except Exception as e:
-        st.error(f"Error querying Azure AI Search: {e}")
+        # This will catch the EOFError and display a clean message instead of crashing.
+        st.error(f"Could not connect to Azure AI Search. Please check your network/firewall settings. Details: {e}")
         return ""
 
-# --- Modified OpenAI Service with Dynamic Prompting ---
+# --- OpenAI Service with Dynamic Prompting ---
 def get_chat_completion(messages_from_ui, search_client: SearchClient, image_data=None):
     client = get_azure_openai_client()
     
-    # --- FIX: Dynamic System Prompt Logic ---
     last_user_message = messages_from_ui[-1]['content']
     context = get_context_from_azure_search(last_user_message, search_client)
     
     if context:
-        # If we found relevant context, instruct the bot to be a document expert.
         system_prompt = (
             "You are an expert AI assistant for document analysis. Answer the user's questions based ONLY on the provided context. "
             "If the answer is in the context, cite your sources using the [SOURCE: 'filename', page X] format. "
@@ -170,7 +171,6 @@ def get_chat_completion(messages_from_ui, search_client: SearchClient, image_dat
         )
         system_prompt += f"\n\n--- CONTEXT FROM DOCUMENT ---\n{context}\n--- END OF CONTEXT ---"
     else:
-        # If no context was found, instruct the bot to be a general-purpose assistant.
         system_prompt = (
             "You are a helpful AI assistant. Answer the user's question to the best of your ability. "
             "If you are asked a question about a specific document, inform the user that no document has been processed "
@@ -180,19 +180,22 @@ def get_chat_completion(messages_from_ui, search_client: SearchClient, image_dat
     api_messages = [{"role": "system", "content": system_prompt}] + \
                    [{"role": msg["role"], "content": msg["content"]} for msg in messages_from_ui]
     
-    # Vision logic remains for potential future use
-    if image_data:
-        # (Implementation details for multimodal messages go here)
-        pass
+    try:
+        # FIX #2 (cont.): Add final error handling around the OpenAI call itself.
+        return client.chat.completions.create(
+            model=os.getenv("GPT4_DEPLOYMENT_NAME"),
+            messages=api_messages,
+            stream=True,
+            temperature=0.7
+        )
+    except Exception as e:
+        st.error(f"Error connecting to Azure OpenAI. Please check your network/firewall settings. Details: {e}")
+        # Return an empty stream or a specific error message if the call fails.
+        # This is an advanced technique; for now, the error message is sufficient.
+        return iter([])
 
-    return client.chat.completions.create(
-        model=os.getenv("GPT4_DEPLOYMENT_NAME"),
-        messages=api_messages,
-        stream=True,
-        temperature=0.7 # A balanced temperature for both factual and general conversation
-    )
 
-# --- Speech and Other Services (Remain unchanged) ---
+# --- Speech Services ---
 def synthesize_text_to_speech(text):
     speech_config = get_speech_config()
     synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=None)
