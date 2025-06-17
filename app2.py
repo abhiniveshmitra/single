@@ -1,24 +1,3 @@
-# requirements.txt
-
-# Core application framework
-streamlit
-python-dotenv
-openai
-
-# Azure SDKs for services that are working
-azure-ai-documentintelligence
-azure-core
-azure-cognitiveservices-speech
-
-# NEW: The Final, Lightweight Local Vector Search Pipeline
-chromadb
-light-embed           # NEW: The lightweight embedding library with no heavy dependencies
-
-# LangChain and supporting libraries
-langchain-community
-langchain-openai
-tiktoken
-pypdf
 # src/document_processor.py
 
 import os
@@ -28,7 +7,7 @@ from azure.core.credentials import AzureKeyCredential
 from azure.ai.documentintelligence import DocumentIntelligenceClient
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
-from light_embed import LightEmbed # THE NEW IMPORT
+from light_embed.embedding import Embedding # THE DEFINITIVE FIX: Correct import statement
 
 CHROMA_PATH = "chroma_db"
 
@@ -69,16 +48,14 @@ def process_and_index_document(uploaded_file, collection_name: str):
         chunks = text_splitter.split_text(text=full_content)
         chunk_ids = [str(uuid.uuid4()) for _ in chunks]
 
-    # --- THE RADICAL CHANGE: USING LIGHTEMBED ---
+    # --- Using LightEmbed with the correct class name ---
     with st.spinner("Creating embeddings locally with LightEmbed..."):
         try:
-            # Instantiate the lightweight model
-            embedding_model = LightEmbed()
+            # THE DEFINITIVE FIX: Instantiate the correct 'Embedding' class
+            embedding_model = Embedding()
             
-            # Manually create the embeddings for our text chunks
             vectors = embedding_model.embed(chunks)
 
-            # Manually create the ChromaDB collection and add the data
             db = Chroma(
                 collection_name=collection_name,
                 persist_directory=CHROMA_PATH
@@ -100,7 +77,7 @@ import streamlit as st
 from openai import AzureOpenAI
 import azure.cognitiveservices.speech as speechsdk
 from langchain_community.vectorstores import Chroma
-from light_embed import LightEmbed # THE NEW IMPORT
+from light_embed.embedding import Embedding # THE DEFINITIVE FIX: Correct import statement
 
 CHROMA_PATH = "chroma_db"
 
@@ -123,7 +100,8 @@ def get_speech_config():
 @st.cache_resource
 def get_embedding_model():
     """Loads the LightEmbed model once and caches it."""
-    return LightEmbed()
+    # THE DEFINITIVE FIX: Instantiate the correct 'Embedding' class
+    return Embedding()
 
 # --- Function to Load ChromaDB ---
 def load_chroma_collection(collection_name: str):
@@ -145,11 +123,9 @@ def get_chat_completion(messages_from_ui, vector_store: Chroma, image_data=None)
     if vector_store:
         last_user_message = messages_from_ui[-1]['content']
         
-        # --- THE RADICAL CHANGE: MANUALLY EMBED THE QUERY ---
-        embedding_model = get_embedding_model() # Get the cached model
-        query_vector = embedding_model.embed(last_user_message)[0] # Embed the query and get the vector
+        embedding_model = get_embedding_model()
+        query_vector = embedding_model.embed(last_user_message)[0]
         
-        # Search the database using the vector, not the text
         results = vector_store.similarity_search_by_vector(embedding=query_vector, k=4)
         
         if results:
@@ -187,5 +163,4 @@ def synthesize_text_to_speech(text):
     synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=None)
     result = synthesizer.speak_text_async(text).get()
     return result.audio_data if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted else None
-
 
