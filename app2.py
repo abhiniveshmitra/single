@@ -22,7 +22,6 @@ def main():
     args = parser.parse_args()
 
     # --- Collection Name ---
-    # Create a clean collection name from the filename
     collection_name = os.path.basename(args.file_path).lower()
     collection_name = "".join(c for c in collection_name if c.isalnum() or c in "._-").rstrip()
 
@@ -64,70 +63,14 @@ def main():
     print(f"[SUCCESS] Content split into {len(chunks)} chunks.")
     sys.stdout.flush()
 
-    # --- Step 4: Embedding and Indexing ---
+    # --- Step 4: Embedding and Indexing with DETAILED LOGGING ---
     print("\nStep 4/4: Creating embeddings with Azure OpenAI and indexing locally...")
     sys.stdout.flush()
     try:
-        # --- THE DEFINITIVE FIX ---
-        # Be fully explicit when creating the embeddings client to avoid any ambiguity
-        # with environment variables or API versions. This is the most robust way.
-        embeddings_model = AzureOpenAIEmbeddings(
-            api_key=os.getenv("AZURE_OPENAI_API_KEY"),
-            azure_deployment=os.getenv("ADA_DEPLOYMENT_NAME"),
-            azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
-            openai_api_version="2024-02-01" # A known stable API version
-        )
-
-        Chroma.from_texts(
-            texts=chunks, 
-            embedding=embeddings_model, 
-            collection_name=collection_name, 
-            persist_directory=CHROMA_PATH
-        )
-        print("\n[SUCCESS] Document successfully ingested!")
-        print(f"Collection '{collection_name}' is now ready to be loaded in the app.")
-    except Exception as e:
-        print(f"[ERROR] Failed to create vector store. Check your Azure OpenAI credentials and network. Details: {e}")
-    sys.stdout.flush()
-
-if __name__ == "__main__":
-    main()
-# src/azure_services.py
-
-import os
-import streamlit as st
-from openai import AzureOpenAI
-import azure.cognitiveservices.speech as speechsdk
-from langchain_community.vectorstores import Chroma
-from langchain_openai import AzureOpenAIEmbeddings
-
-CHROMA_PATH = "chroma_db"
-
-# --- Client Initialization ---
-@st.cache_resource
-def get_azure_openai_client():
-    """Initializes and returns a cached AzureOpenAI client for chat."""
-    return AzureOpenAI(
-        api_key=os.getenv("AZURE_OPENAI_API_KEY"),
-        api_version="2024-05-01-preview",
-        azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT")
-    )
-
-@st.cache_resource
-def get_speech_config():
-    """Initializes and returns a cached Azure Speech service configuration."""
-    return speechsdk.SpeechConfig(
-        subscription=os.getenv("SPEECH_KEY"),
-        region=os.getenv("SPEECH_REGION")
-    )
-
-# --- Function to Load a PRE-COMPUTED ChromaDB collection ---
-def load_chroma_collection(collection_name: str):
-    """Loads an existing ChromaDB collection that was created by ingest.py."""
-    try:
-        # --- THE DEFINITIVE FIX ---
-        # We must use the exact same explicit instantiation logic here to ensure
-        # the app can correctly communicate with the vector database.
+        # LOGGING: Announce the start of model initialization
+        print("Initializing AzureOpenAIEmbeddings model...")
+        sys.stdout.flush()
+        
         embeddings_model = AzureOpenAIEmbeddings(
             api_key=os.getenv("AZURE_OPENAI_API_KEY"),
             azure_deployment=os.getenv("ADA_DEPLOYMENT_NAME"),
@@ -135,59 +78,29 @@ def load_chroma_collection(collection_name: str):
             openai_api_version="2024-02-01"
         )
         
-        db = Chroma(
-            persist_directory=CHROMA_PATH, 
-            embedding_function=embeddings_model,
-            collection_name=collection_name
+        # LOGGING: Confirm model has been initialized
+        print("AzureOpenAIEmbeddings model initialized successfully.")
+        sys.stdout.flush()
+
+        # LOGGING: Announce the start of the embedding process
+        print("Calling Chroma.from_texts to create embeddings and index chunks...")
+        sys.stdout.flush()
+        
+        Chroma.from_texts(
+            texts=chunks, 
+            embedding=embeddings_model, 
+            collection_name=collection_name, 
+            persist_directory=CHROMA_PATH
         )
-        return db
+
+        # LOGGING: Confirm the process is complete
+        print("Chroma.from_texts finished successfully.")
+        print("\n[SUCCESS] Document successfully ingested!")
+        print(f"Collection '{collection_name}' is now ready to be loaded in the app.")
     except Exception as e:
-        st.error(f"Failed to load collection '{collection_name}'. Make sure you have ingested it first. Error: {e}")
-        return None
+        # LOGGING: Provide a detailed error message if anything fails
+        print(f"[ERROR] An exception occurred during embedding or indexing. Check Azure OpenAI credentials and network. Details: {e}")
+    sys.stdout.flush()
 
-# --- Chat Completion Function ---
-def get_chat_completion(messages_from_ui, vector_store: Chroma, image_data=None):
-    """Generates a chat response, using a local ChromaDB vector store for context."""
-    client = get_azure_openai_client()
-    context = ""
-    if vector_store:
-        last_user_message = messages_from_ui[-1]['content']
-        # LangChain uses the embedding_function attached to the vector_store to handle the query
-        results = vector_store.similarity_search(last_user_message, k=4)
-        if results:
-            context = "\n\n".join([doc.page_content for doc in results])
-
-    if context:
-        system_prompt = (
-            "You are an expert AI assistant for document analysis. Answer the user's questions based ONLY on the provided context. "
-            "If the answer is not in the context, state that the document does not contain the answer."
-        )
-        system_prompt += f"\n\n--- CONTEXT FROM DOCUMENT ---\n{context}\n--- END OF CONTEXT ---"
-    else:
-        system_prompt = (
-            "You are a helpful AI assistant. Answer the user's question to the best of your ability. "
-            "If asked about a document, say that no document has been processed or no relevant information was found."
-        )
-    
-    api_messages = [{"role": "system", "content": system_prompt}] + \
-                   [{"role": msg["role"], "content": msg["content"]} for msg in messages_from_ui]
-    
-    try:
-        return client.chat.completions.create(
-            model=os.getenv("GPT4_DEPLOYMENT_NAME"),
-            messages=api_messages,
-            stream=True,
-            temperature=0.7
-        )
-    except Exception as e:
-        st.error(f"Error connecting to Azure OpenAI: {e}")
-        return iter([])
-
-# --- Speech Services ---
-def synthesize_text_to_speech(text):
-    """Generates speech from text using Azure Speech Services."""
-    speech_config = get_speech_config()
-    synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=None)
-    result = synthesizer.speak_text_async(text).get()
-    return result.audio_data if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted else None
-
+if __name__ == "__main__":
+    main()
