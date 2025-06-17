@@ -1,165 +1,98 @@
-# src/azure_services.py
+# app.py
 
 import os
+# --- THE RADICAL AND FINAL FIX ---
+# This line MUST be at the absolute top of your script, before any other imports
+# that might load conflicting libraries (like numpy, torch, etc.).
+# It tells the system's math libraries to allow multiple versions to be loaded,
+# resolving the underlying DLL conflict that causes the app to crash silently.
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
 import streamlit as st
-from openai import AzureOpenAI
-import azure.cognitiveservices.speech as speechsdk
-from langchain_community.vectorstores import Chroma
-from langchain_openai import AzureOpenAIEmbeddings
+from dotenv import load_dotenv
+from src import database, azure_services, ui_components
 
-CHROMA_PATH = "chroma_db"
+# --- Page Config and Initialization ---
+# This sets up the browser tab title and loads your secret credentials.
+st.set_page_config(page_title="Azure AI Chat", layout="centered")
+load_dotenv()
+database.init_db()
 
-# --- THE RADICAL CHANGE: CACHED MODEL LOADING ---
-@st.cache_resource
-def get_embedding_model():
-    """
-    Loads the AzureOpenAIEmbeddings model once and caches it as a global resource.
-    This is the definitive solution to prevent memory-related crashes.
-    """
-    st.info("Initializing Azure OpenAI embedding model... (This happens only once per session)")
-    # On the first run, this will connect to Azure and set up the model object.
-    # On every subsequent rerun, Streamlit will return the cached object instantly.
-    return AzureOpenAIEmbeddings(
-        azure_deployment=os.getenv("ADA_DEPLOYMENT_NAME"),
-        openai_api_version="2024-05-01-preview",
-    )
+# Initialize all session state variables at the beginning to prevent errors.
+# This ensures that even on the first run, these keys exist.
+if "vector_store" not in st.session_state:
+    st.session_state.vector_store = None
+if "collection_name" not in st.session_state:
+    st.session_state.collection_name = None
+if "current_chat_id" not in st.session_state:
+    st.session_state.current_chat_id = None
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "staged_image" not in st.session_state:
+    st.session_state.staged_image = None
 
+# This logic makes the document context persistent within a session.
+# If the app reruns, it will try to reload the last used ChromaDB collection.
+if st.session_state.collection_name and not st.session_state.vector_store:
+    with st.spinner(f"Reloading '{st.session_state.collection_name}' from local storage..."):
+        st.session_state.vector_store = azure_services.load_chroma_collection(st.session_state.collection_name)
 
-# --- Client Initialization ---
-@st.cache_resource
-def get_azure_openai_client():
-    return AzureOpenAI(
-        api_key=os.getenv("AZURE_OPENAI_API_KEY"),
-        api_version="2024-05-01-preview",
-        azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT")
-    )
+# --- UI Rendering ---
+# These two lines draw the entire user interface.
+ui_components.render_sidebar()
+st.title("Azure AI Chat Assistant")
+st.info("To ask questions about a document, please upload and process it using the options in the sidebar.")
+ui_components.render_chat_messages()
 
-@st.cache_resource
-def get_speech_config():
-    return speechsdk.SpeechConfig(
-        subscription=os.getenv("SPEECH_KEY"),
-        region=os.getenv("SPEECH_REGION")
-    )
+# --- User Input Handling ---
+# This block captures when the user types something and hits Enter.
+if prompt := st.chat_input("Ask a question..."):
+    
+    # If this is the very first message, create a new chat session in the database.
+    if st.session_state.current_chat_id is None:
+        new_chat_title = prompt[:40] + "..."
+        st.session_state.current_chat_id = database.add_chat(new_chat_title)
+        st.session_state.messages = []
 
-# --- Updated Function to Load ChromaDB ---
-def load_chroma_collection(collection_name: str):
-    """Loads an existing ChromaDB collection using the cached embedding model."""
-    try:
-        # Use the cached function to get the model object
-        embeddings_model = get_embedding_model()
+    # Prepare the user message object, including the staged image if one exists.
+    # This reflects your expertise in building AI systems with image analysis capabilities[2].
+    user_message = {"role": "user", "content": prompt}
+    if st.session_state.staged_image:
+        user_message["image"] = st.session_state.staged_image
+        st.session_state.staged_image = None
         
-        db = Chroma(
-            persist_directory=CHROMA_PATH, 
-            embedding_function=embeddings_model,
-            collection_name=collection_name
-        )
-        return db
-    except Exception as e:
-        st.info(f"Chroma collection '{collection_name}' not found.")
-        return None
+    # Add the message to the session state and database, then rerun to display it immediately.
+    st.session_state.messages.append(user_message)
+    database.add_message(st.session_state.current_chat_id, "user", prompt)
+    st.rerun()
 
-# --- Chat Completion Function (No changes to its internal logic) ---
-def get_chat_completion(messages_from_ui, vector_store: Chroma, image_data=None):
-    client = get_azure_openai_client()
-    context = ""
-    if vector_store:
-        last_user_message = messages_from_ui[-1]['content']
-        results = vector_store.similarity_search(last_user_message, k=4)
-        if results:
-            context = "\n\n".join([doc.page_content for doc in results])
-    if context:
-        system_prompt = (
-            "You are an expert AI assistant for document analysis. Answer the user's questions based ONLY on the provided context. "
-            "If the answer is not in the context, state that the document does not contain the answer."
-        )
-        system_prompt += f"\n\n--- CONTEXT FROM DOCUMENT ---\n{context}\n--- END OF CONTEXT ---"
-    else:
-        system_prompt = (
-            "You are a helpful AI assistant. Answer the user's question to the best of your ability. "
-            "If asked about a document, say that no document has been processed or no relevant information was found."
-        )
-    api_messages = [{"role": "system", "content": system_prompt}] + \
-                   [{"role": msg["role"], "content": msg["content"]} for msg in messages_from_ui]
-    try:
-        return client.chat.completions.create(
-            model=os.getenv("GPT4_DEPLOYMENT_NAME"),
-            messages=api_messages,
-            stream=True,
-            temperature=0.7
-        )
-    except Exception as e:
-        st.error(f"Error connecting to Azure OpenAI: {e}")
-        return iter([])
-
-# --- Speech Services (No changes) ---
-def synthesize_text_to_speech(text):
-    speech_config = get_speech_config()
-    synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=None)
-    result = synthesizer.speak_text_async(text).get()
-    return result.audio_data if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted else None
-# src/document_processor.py
-
-import os
-import streamlit as st
-from azure.core.credentials import AzureKeyCredential
-from azure.ai.documentintelligence import DocumentIntelligenceClient
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import Chroma
-from src import azure_services # Import our services module to access the cached function
-
-CHROMA_PATH = "chroma_db"
-
-def process_and_index_document(uploaded_file, collection_name: str):
-    """
-    Analyzes a document, chunks it, and creates embeddings using the
-    centrally cached Azure OpenAI embedding model.
-    """
-    # --- Document Intelligence analysis part remains the same ---
-    doc_intel_endpoint = os.getenv("DOCUMENT_INTELLIGENCE_ENDPOINT")
-    doc_intel_key = os.getenv("DOCUMENT_INTELLIGENCE_KEY")
-
-    with st.spinner(f"Analyzing document '{uploaded_file.name}'..."):
-        try:
-            document_intelligence_client = DocumentIntelligenceClient(
-                endpoint=doc_intel_endpoint, credential=AzureKeyCredential(doc_intel_key)
+# --- AI Response Generation ---
+# This block runs only after a user message has been submitted and displayed.
+if st.session_state.messages and st.session_state.messages[-1]["role"] == "user":
+    
+    with st.chat_message("assistant"):
+        with st.spinner("Thinking..."):
+            # Call the main AI service, passing the chat history and the active vector store.
+            stream = azure_services.get_chat_completion(
+                messages_from_ui=st.session_state.messages,
+                vector_store=st.session_state.get("vector_store")
             )
-            file_bytes = uploaded_file.read()
-            poller = document_intelligence_client.begin_analyze_document(
-                "prebuilt-layout", file_bytes, content_type="application/octet-stream"
-            )
-            result = poller.result()
-        except Exception as e:
-            st.error(f"Error during document analysis: {e}")
-            return None
-
-    full_content = ""
-    if result.paragraphs:
-        for para in result.paragraphs:
-            full_content += para.content + "\n"
-    if not full_content:
-        st.warning("⚠️ No text content extracted.")
-        return None
-
-    # --- Text Splitting remains the same ---
-    with st.spinner("Preparing content for embedding..."):
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-        chunks = text_splitter.split_text(text=full_content)
-
-    # --- Using the CACHED Azure OpenAI embedding model ---
-    with st.spinner("Creating embeddings via Azure OpenAI... This may take a moment."):
-        try:
-            # --- THE FIX ---
-            # Call the cached function to get the single, shared instance of the model.
-            embeddings_model = azure_services.get_embedding_model()
-            
-            db = Chroma.from_texts(
-                texts=chunks, 
-                embedding=embeddings_model,
-                collection_name=collection_name,
-                persist_directory=CHROMA_PATH
-            )
-            st.success("✅ Document successfully indexed using Azure OpenAI embeddings.")
-            return db
-        except Exception as e:
-            st.error(f"Error creating vector store. Check your Azure OpenAI credentials and network. Details: {e}")
-            return None
+            response_content = st.write_stream(stream)
+    
+    # Prepare the assistant's message object.
+    assistant_message = {"role": "assistant", "content": response_content}
+    
+    # If TTS is enabled, generate the audio and add it to the message object.
+    # This leverages your experience with text-to-speech technologies[1].
+    if st.session_state.get("tts_enabled", False):
+        with st.spinner("Synthesizing audio..."):
+            audio_data = azure_services.synthesize_text_to_speech(response_content)
+            if audio_data:
+                assistant_message["audio"] = audio_data
+    
+    # Save the complete assistant message to the session state and database.
+    st.session_state.messages.append(assistant_message)
+    database.add_message(st.session_state.current_chat_id, "assistant", response_content)
+    
+    # Final rerun to settle the UI and wait for the next user input.
+    st.rerun()
