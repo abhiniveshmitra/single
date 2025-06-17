@@ -97,3 +97,69 @@ def synthesize_text_to_speech(text):
     synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=None)
     result = synthesizer.speak_text_async(text).get()
     return result.audio_data if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted else None
+# src/document_processor.py
+
+import os
+import streamlit as st
+from azure.core.credentials import AzureKeyCredential
+from azure.ai.documentintelligence import DocumentIntelligenceClient
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import Chroma
+from src import azure_services # Import our services module to access the cached function
+
+CHROMA_PATH = "chroma_db"
+
+def process_and_index_document(uploaded_file, collection_name: str):
+    """
+    Analyzes a document, chunks it, and creates embeddings using the
+    centrally cached Azure OpenAI embedding model.
+    """
+    # --- Document Intelligence analysis part remains the same ---
+    doc_intel_endpoint = os.getenv("DOCUMENT_INTELLIGENCE_ENDPOINT")
+    doc_intel_key = os.getenv("DOCUMENT_INTELLIGENCE_KEY")
+
+    with st.spinner(f"Analyzing document '{uploaded_file.name}'..."):
+        try:
+            document_intelligence_client = DocumentIntelligenceClient(
+                endpoint=doc_intel_endpoint, credential=AzureKeyCredential(doc_intel_key)
+            )
+            file_bytes = uploaded_file.read()
+            poller = document_intelligence_client.begin_analyze_document(
+                "prebuilt-layout", file_bytes, content_type="application/octet-stream"
+            )
+            result = poller.result()
+        except Exception as e:
+            st.error(f"Error during document analysis: {e}")
+            return None
+
+    full_content = ""
+    if result.paragraphs:
+        for para in result.paragraphs:
+            full_content += para.content + "\n"
+    if not full_content:
+        st.warning("⚠️ No text content extracted.")
+        return None
+
+    # --- Text Splitting remains the same ---
+    with st.spinner("Preparing content for embedding..."):
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+        chunks = text_splitter.split_text(text=full_content)
+
+    # --- Using the CACHED Azure OpenAI embedding model ---
+    with st.spinner("Creating embeddings via Azure OpenAI... This may take a moment."):
+        try:
+            # --- THE FIX ---
+            # Call the cached function to get the single, shared instance of the model.
+            embeddings_model = azure_services.get_embedding_model()
+            
+            db = Chroma.from_texts(
+                texts=chunks, 
+                embedding=embeddings_model,
+                collection_name=collection_name,
+                persist_directory=CHROMA_PATH
+            )
+            st.success("✅ Document successfully indexed using Azure OpenAI embeddings.")
+            return db
+        except Exception as e:
+            st.error(f"Error creating vector store. Check your Azure OpenAI credentials and network. Details: {e}")
+            return None
