@@ -1,167 +1,60 @@
-# src/ui_components.py
+# src/document_processor.py
 
-import streamlit as st
-import pypdf2
-from src import database
+import numpy as np
+import faiss
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 
-def render_sidebar():
-    """Renders all sidebar components with the corrected logic."""
-    with st.sidebar:
-        st.header("Azure AI Assistant")
-        if st.button("➕ New Chat", use_container_width=True):
-            st.session_state.clear()
-            st.rerun()
+class DocumentProcessor:
+    """
+    Handles chunking text, creating embeddings, and searching an in-memory FAISS index.
+    Now uses a smart index selection logic to handle documents of all sizes.
+    """
+    def __init__(self, embedding_model):
+        self.embedding_model = embedding_model
+        self.index = None
+        self.text_chunks = []
 
-        st.subheader("Previous Chats")
-        chats = database.get_chats()
-        for chat_id, title, _ in chats:
-            if st.button(title, key=f"chat_{chat_id}", use_container_width=True):
-                st.session_state.current_chat_id = chat_id
-                st.session_state.messages = database.get_messages(chat_id)
-                st.session_state.document_processor = None
-                st.session_state.raw_text = None
-                st.session_state.staged_image = None
-                st.rerun()
+    def chunk_and_vectorize(self, text: str):
+        """Chunks the text and builds the appropriate FAISS index based on data size."""
+        # 1. Chunk the text
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+        self.text_chunks = text_splitter.split_text(text)
 
-        st.divider()
-        st.header("Document Q&A")
-        st.write("Upload a document to enable Q&A for this session.")
+        # 2. Create embeddings for the chunks
+        embeddings = self.embedding_model.embed_documents(self.text_chunks)
+        embeddings_np = np.array(embeddings).astype('float32')
+        dimension = embeddings_np.shape[1]
+
+        # --- THE DEFINITIVE FIX: Smart Index Selection ---
+        num_chunks = len(self.text_chunks)
         
-        uploaded_doc = st.file_uploader(
-            "Upload a document", 
-            type=["pdf"]
-        )
-        
-        if uploaded_doc:
-            with st.spinner("Reading document..."):
-                try:
-                    pdf_reader = pypdf2.PdfReader(uploaded_doc)
-                    text = "".join(page.extract_text() for page in pdf_reader.pages if page.extract_text())
-                    st.session_state.raw_text = text
-                    st.session_state.document_processor = None 
-                    st.success(f"'{uploaded_doc.name}' read successfully.")
-                except Exception as e:
-                    st.error(f"Failed to read PDF: {e}")
-        
-        # THE DEFINITIVE FIX: This safer logic prevents the AttributeError.
-        if st.session_state.get('document_processor'):
-            st.success("✅ Document is processed and ready for Q&A.")
-        elif st.session_state.get('raw_text'):
-             st.info("Document loaded. Processing will start with your first question.")
-
-        st.divider()
-        st.header("Tools & Settings")
-        st.subheader("Image Analysis")
-        uploaded_image = st.file_uploader("Upload an Image", type=['jpg', 'png', 'jpeg'], key="img_uploader")
-        if uploaded_image:
-            st.session_state.staged_image = uploaded_image.read()
-            st.success("Image staged for the next message.")
-
-        if st.session_state.get("staged_image"):
-            st.image(st.session_state.staged_image, caption="This image is staged.")
-            if st.button("Clear Staged Image", use_container_width=True):
-                st.session_state.staged_image = None
-                st.rerun()
-        
-        st.subheader("Audio Tools")
-        st.session_state.tts_enabled = st.toggle("Enable Text-to-Speech", value=False)
-
-
-def render_chat_messages():
-    """Renders the complete chat history."""
-    for message in st.session_state.get("messages", []):
-        with st.chat_message(message["role"]):
-            if "image" in message and message.get("image"):
-                st.image(message["image"])
-            st.markdown(message["content"])
-            if "audio" in message and message.get("audio"):
-                st.audio(message["audio"], format="audio/wav")
-# app.py
-
-import os
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-
-import streamlit as st
-from dotenv import load_dotenv
-from src import database, azure_services, ui_components
-from src.document_processor import DocumentProcessor
-
-st.set_page_config(page_title="Simple AI Chat", layout="centered")
-load_dotenv()
-
-# --- Robust Session State Initialization ---
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-if "current_chat_id" not in st.session_state:
-    st.session_state.current_chat_id = None
-if "document_processor" not in st.session_state:
-    st.session_state.document_processor = None
-if "raw_text" not in st.session_state:
-    st.session_state.raw_text = None
-if "staged_image" not in st.session_state:
-    st.session_state.staged_image = None
-
-database.init_db()
-ui_components.render_sidebar()
-st.title("Simple Document Q&A")
-ui_components.render_chat_messages()
-
-# --- Main Logic: Process Document if raw_text exists ---
-if st.session_state.get("raw_text") and st.session_state.get("document_processor") is None:
-    with st.spinner("Processing document: chunking text and creating vector index..."):
-        try:
-            embedding_model = azure_services.get_embedding_model()
-            processor = DocumentProcessor(embedding_model)
-            processor.chunk_and_vectorize(st.session_state.raw_text)
-            st.session_state.document_processor = processor
-            st.session_state.raw_text = None 
-            st.rerun()
-        except Exception as e:
-            st.error(f"Failed to process document: {e}")
-            st.stop()
-
-# --- Chat Input and Response Logic ---
-if prompt := st.chat_input("Ask a question..."):
-    if st.session_state.current_chat_id is None:
-        new_chat_title = prompt[:40] + "..."
-        st.session_state.current_chat_id = database.add_chat(new_chat_title)
-        st.session_state.messages = []
-
-    user_message = {"role": "user", "content": prompt}
-    if st.session_state.staged_image:
-        user_message["image"] = st.session_state.staged_image
-        st.session_state.staged_image = None
-        
-    st.session_state.messages.append(user_message)
-    database.add_message(st.session_state.current_chat_id, "user", prompt)
-    
-    with st.chat_message("user"):
-        if "image" in user_message and user_message.get("image"):
-            st.image(user_message["image"])
-        st.markdown(prompt)
-
-    with st.chat_message("assistant"):
-        with st.spinner("Thinking..."):
-            context_chunks = []
-            if st.session_state.document_processor:
-                context_chunks = st.session_state.document_processor.search(prompt)
+        # FAISS's IVF index needs at least 39 training points by default.
+        # If we have fewer chunks than that, use a simpler, exact search index.
+        if num_chunks < 39:
+            # Use IndexFlatL2 for small datasets. It's a brute-force search
+            # and doesn't require any training.
+            self.index = faiss.IndexFlatL2(dimension)
+            self.index.add(embeddings_np)
+        else:
+            # For larger datasets, use the efficient approximate search index.
+            quantizer = faiss.IndexFlatL2(dimension)
+            nlist = min(100, int(np.sqrt(num_chunks))) # A common heuristic for nlist
+            self.index = faiss.IndexIVFFlat(quantizer, dimension, nlist, faiss.METRIC_L2)
             
-            stream = azure_services.get_chat_completion(
-                st.session_state.messages, 
-                context_chunks
-            )
-            response_content = st.write_stream(stream)
-
-    assistant_message = {"role": "assistant", "content": response_content}
-    if st.session_state.get("tts_enabled", False):
-        with st.spinner("Synthesizing audio..."):
-            audio_data = azure_services.synthesize_text_to_speech(response_content)
-            if audio_data:
-                assistant_message["audio"] = audio_data
-    
-    st.session_state.messages.append(assistant_message)
-    database.add_message(st.session_state.current_chat_id, "assistant", response_content)
-    
-    st.rerun()
+            # Train the index with the embeddings
+            self.index.train(embeddings_np)
+            self.index.add(embeddings_np)
 
 
+    def search(self, query: str, k: int = 4):
+        """Searches the FAISS index for the most relevant chunks."""
+        if not self.index:
+            return []
+        
+        query_embedding = self.embedding_model.embed_query(query)
+        query_embedding_np = np.array([query_embedding]).astype('float32')
+        
+        distances, indices = self.index.search(query_embedding_np, k)
+        
+        results = [self.text_chunks[i] for i in indices[0] if i != -1 and i < len(self.text_chunks)]
+        return results
