@@ -1,60 +1,70 @@
-# src/document_processor.py
+import json
+import uuid
+import random
+from datetime import datetime, timedelta
 
-import numpy as np
-import faiss
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-
-class DocumentProcessor:
+def generate_call_records_to_file(num_records=50, output_filename="call_records.jsonl"):
     """
-    Handles chunking text, creating embeddings, and searching an in-memory FAISS index.
-    Now uses a smart index selection logic to handle documents of all sizes.
+    Generates realistic, flattened Microsoft Teams call records and saves them
+    to a specified output file in JSONL format.
     """
-    def __init__(self, embedding_model):
-        self.embedding_model = embedding_model
-        self.index = None
-        self.text_chunks = []
+    
+    sample_upns = [
+        "adele.vance@contoso.com",
+        "alex.wilber@contoso.com",
+        "megan.bowen@contoso.com",
+        "lynne.robbins@contoso.com",
+        "diego.siciliani@contoso.com",
+        "patti.ferguson@contoso.com"
+    ]
 
-    def chunk_and_vectorize(self, text: str):
-        """Chunks the text and builds the appropriate FAISS index based on data size."""
-        # 1. Chunk the text
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-        self.text_chunks = text_splitter.split_text(text)
+    print(f"--- Generating {num_records} sample call records and saving to '{output_filename}' ---")
 
-        # 2. Create embeddings for the chunks
-        embeddings = self.embedding_model.embed_documents(self.text_chunks)
-        embeddings_np = np.array(embeddings).astype('float32')
-        dimension = embeddings_np.shape[1]
-
-        # --- THE DEFINITIVE FIX: Smart Index Selection ---
-        num_chunks = len(self.text_chunks)
-        
-        # FAISS's IVF index needs at least 39 training points by default.
-        # If we have fewer chunks than that, use a simpler, exact search index.
-        if num_chunks < 39:
-            # Use IndexFlatL2 for small datasets. It's a brute-force search
-            # and doesn't require any training.
-            self.index = faiss.IndexFlatL2(dimension)
-            self.index.add(embeddings_np)
-        else:
-            # For larger datasets, use the efficient approximate search index.
-            quantizer = faiss.IndexFlatL2(dimension)
-            nlist = min(100, int(np.sqrt(num_chunks))) # A common heuristic for nlist
-            self.index = faiss.IndexIVFFlat(quantizer, dimension, nlist, faiss.METRIC_L2)
+    # Use 'with open' to handle the file safely. It will automatically close the file.
+    # We open the file in 'w' (write) mode.
+    with open(output_filename, 'w') as f:
+        for _ in range(num_records):
+            # 1. GENERATE A REALISTIC, NESTED CALL RECORD OBJECT
+            call_id = str(uuid.uuid4())
+            call_type = random.choice(["groupCall", "peerToPeer"])
+            start_time = datetime.utcnow() - timedelta(minutes=random.randint(5, 120))
+            end_time = start_time + timedelta(minutes=random.randint(1, 45))
             
-            # Train the index with the embeddings
-            self.index.train(embeddings_np)
-            self.index.add(embeddings_np)
+            organizer_upn = random.choice(sample_upns)
+            participant_upn = random.choice([u for u in sample_upns if u != organizer_upn])
+            
+            possible_modalities = ["audio", "video", "videoBasedScreenSharing"]
+            call_modalities = random.sample(possible_modalities, k=random.randint(1, len(possible_modalities)))
+
+            jitter_value = random.uniform(0.005, 0.080) if random.random() > 0.2 else None
+            average_jitter = f"PT{jitter_value:.3f}S" if jitter_value else None # ISO 8601 duration format
+
+            avg_audio_degradation = round(random.uniform(0.1, 1.0), 2) if random.random() > 0.6 else None
+
+            # 2. FLATTEN THE RECORD FOR ANALYSIS
+            flattened_data = {
+                "conferenceId": call_id,
+                "callType": call_type,
+                "startDateTime": start_time.isoformat() + "Z",
+                "endDateTime": end_time.isoformat() + "Z",
+                "modalities": call_modalities,
+                "organizerUPN": organizer_upn,
+                "participantUPN": participant_upn,
+                "clientPlatform": random.choice(["windows", "macOS", "android"]),
+                "averageJitter": average_jitter,
+                "averageAudioDegradation": avg_audio_degradation,
+                "joinWebUrl": f"https://teams.microsoft.com/l/meetup-join/19%3ameeting_{uuid.uuid4().hex}%40thread.v2/0" if call_type == "groupCall" else None,
+            }
+
+            # 3. WRITE THE FLATTENED JSON OBJECT TO THE FILE
+            # json.dumps() converts the Python dictionary to a JSON string.
+            # We add a newline character '\n' to ensure each JSON object is on its own line.
+            f.write(json.dumps(flattened_data) + '\n')
+
+    print(f"--- Successfully saved {num_records} records to '{output_filename}' ---")
 
 
-    def search(self, query: str, k: int = 4):
-        """Searches the FAISS index for the most relevant chunks."""
-        if not self.index:
-            return []
-        
-        query_embedding = self.embedding_model.embed_query(query)
-        query_embedding_np = np.array([query_embedding]).astype('float32')
-        
-        distances, indices = self.index.search(query_embedding_np, k)
-        
-        results = [self.text_chunks[i] for i in indices[0] if i != -1 and i < len(self.text_chunks)]
-        return results
+# This block runs when you execute the script directly.
+if __name__ == "__main__":
+    # You can easily change the number of records or the filename here.
+    generate_call_records_to_file(num_records=100, output_filename="sample_cdrs_for_analysis.jsonl")
