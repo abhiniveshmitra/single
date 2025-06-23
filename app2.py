@@ -1,23 +1,9 @@
-# --- DISABLE LANGSMITH/LANGCHAIN CLOUD TRACING (DO NOT REMOVE) ---
-import os
-os.environ["LANGCHAIN_TRACING_V2"] = "false"
-os.environ["LANGCHAIN_API_KEY"] = ""
-
+# generate_cdr_data.py
 import json
 import uuid
 import random
 from datetime import datetime, timedelta
-from dotenv import load_dotenv
 
-# LangChain and related imports
-from langchain.schema import Document
-from langchain_openai import AzureOpenAIEmbeddings, AzureChatOpenAI
-from langchain_community.vectorstores import FAISS
-from langchain.prompts import PromptTemplate
-from langchain.chains import create_retrieval_chain
-from langchain.chains.combine_documents import create_stuff_documents_chain
-
-# 1. SIMULATE MS TEAMS CALL RECORDS (JSONL FILE)
 def generate_call_records_to_file(num_records=100, output_filename="sample_cdrs_for_analysis.jsonl"):
     sample_upns = [
         "adele.vance@contoso.com", "alex.wilber@contoso.com", "megan.bowen@contoso.com",
@@ -48,13 +34,22 @@ def generate_call_records_to_file(num_records=100, output_filename="sample_cdrs_
             }
             f.write(json.dumps(flattened_data) + '\n')
 
-# 2. LOAD & TRANSFORM FOR EMBEDDING (MS TEAMS CDR -> LANGCHAIN DOCS)
+if __name__ == "__main__":
+    generate_call_records_to_file(num_records=100, output_filename="sample_cdrs_for_analysis.jsonl")
+    print("Sample call records generated!")
+#build_embeddings.py
+import os
+from dotenv import load_dotenv
+from langchain.schema import Document
+from langchain_openai import AzureOpenAIEmbeddings
+from langchain_community.vectorstores import FAISS
+import json
+
 def load_cdr_documents_from_jsonl(filepath):
     documents = []
     with open(filepath, 'r') as f:
         for line in f:
             record = json.loads(line)
-            # Construct an indexed string for retrieval—add all call metrics!
             summary = (
                 f"User: {record.get('organizerUPN')}, Platform: {record.get('clientPlatform')}, Headset: {record.get('headsetModel')}. "
                 f"CallType: {record.get('callType')}, Time: {record.get('startDateTime')}, "
@@ -67,16 +62,46 @@ def load_cdr_documents_from_jsonl(filepath):
             documents.append(Document(page_content=summary, metadata=record))
     return documents
 
-# 3. BUILD FAISS INDEX USING AZURE OPENAI EMBEDDINGS
 def build_faiss_index(documents, azure_embedding_args, faiss_index_path):
     embeddings_model = AzureOpenAIEmbeddings(**azure_embedding_args)
     vector_store = FAISS.from_documents(documents, embeddings_model)
     vector_store.save_local(faiss_index_path)
     return vector_store
 
-# 4. RAG CHAIN: RETRIEVE + ACTIONABLE INSIGHT GENERATION
+if __name__ == "__main__":
+    # Load environment
+    load_dotenv()
+    cdr_filename = "sample_cdrs_for_analysis.jsonl"
+    faiss_index_path = "faiss_cdr_index"
+    azure_embedding_args = {
+        "azure_deployment": os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT"),
+        "openai_api_version": os.getenv("OPENAI_API_VERSION"),
+        "openai_api_key": os.getenv("OPENAI_API_KEY"),
+        "azure_endpoint": os.getenv("AZURE_OPENAI_ENDPOINT"),
+    }
+
+    docs = load_cdr_documents_from_jsonl(cdr_filename)
+    build_faiss_index(docs, azure_embedding_args, faiss_index_path)
+    print("FAISS vector index built and saved!")
+# query_insight.py
+# --- DISABLE LANGSMITH CLOUD ---
+import os
+os.environ["LANGCHAIN_TRACING_V2"] = "false"
+os.environ["LANGCHAIN_API_KEY"] = ""
+
+from dotenv import load_dotenv
+from langchain_openai import AzureChatOpenAI
+from langchain_community.vectorstores import FAISS
+from langchain.prompts import PromptTemplate
+from langchain.chains import create_retrieval_chain
+from langchain.chains.combine_documents import create_stuff_documents_chain
+
+def load_vector_store(faiss_index_path, azure_embedding_args):
+    # Rebuild vector store (no need to recompute embeddings)
+    embeddings_model = __import__("langchain_openai").AzureOpenAIEmbeddings(**azure_embedding_args)
+    return FAISS.load_local(faiss_index_path, embeddings_model, allow_dangerous_deserialization=True)
+
 def query_rag_chain(vector_store, azure_chat_args, question):
-    # Prompt instructs GPT to focus on actionable, data-driven advice
     local_prompt_template = """
 You are an expert Teams call analytics assistant.
 - Use ONLY the provided call record data to answer.
@@ -90,22 +115,17 @@ Here are the relevant call records:
 Question: {input}
 Actionable Insight:
 """
-    from langchain.prompts import PromptTemplate
-    llm = AzureChatOpenAI(**azure_chat_args)
     prompt = PromptTemplate.from_template(local_prompt_template)
+    llm = AzureChatOpenAI(**azure_chat_args)
     combine_docs_chain = create_stuff_documents_chain(llm, prompt)
     retrieval_chain = create_retrieval_chain(vector_store.as_retriever(), combine_docs_chain)
     result = retrieval_chain.invoke({"input": question})
     return result["answer"]
 
-# -------------------------- MAIN EXECUTION --------------------------
 if __name__ == "__main__":
     load_dotenv()
-
-    cdr_filename = "sample_cdrs_for_analysis.jsonl"
     faiss_index_path = "faiss_cdr_index"
 
-    # Azure OpenAI environment config
     azure_embedding_args = {
         "azure_deployment": os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT"),
         "openai_api_version": os.getenv("OPENAI_API_VERSION"),
@@ -120,14 +140,9 @@ if __name__ == "__main__":
         "temperature": 0,
     }
 
-    print("--- 1. Generating sample MS Teams call records ---")
-    generate_call_records_to_file(num_records=100, output_filename=cdr_filename)
+    vector_store = load_vector_store(faiss_index_path, azure_embedding_args)
 
-    print("--- 2. Loading and indexing call data ---")
-    docs = load_cdr_documents_from_jsonl(cdr_filename)
-    vector_store = build_faiss_index(docs, azure_embedding_args, faiss_index_path)
-
-    # EXAMPLE QUERIES
+    # General insight
     print("\n=======================================")
     print("         GENERAL ACTIONABLE INSIGHT")
     print("=======================================")
@@ -146,3 +161,4 @@ if __name__ == "__main__":
         f"Analyze all call records for {specific_user}. Summarize any technical problems or patterns and what should be done to improve their experience."
     ))
     print("=======================================\n")
+
