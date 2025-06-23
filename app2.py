@@ -1,4 +1,4 @@
-# --- DISABLE LANGSMITH/LANGCHAIN CLOUD TRACING (MUST BE FIRST!) ---
+# --- DISABLE LANGSMITH/LANGCHAIN CLOUD TRACING (DO NOT REMOVE) ---
 import os
 os.environ["LANGCHAIN_TRACING_V2"] = "false"
 os.environ["LANGCHAIN_API_KEY"] = ""
@@ -13,65 +13,92 @@ from dotenv import load_dotenv
 from langchain.schema import Document
 from langchain_openai import AzureOpenAIEmbeddings, AzureChatOpenAI
 from langchain_community.vectorstores import FAISS
-from langchain import hub
+from langchain.prompts import PromptTemplate
 from langchain.chains import create_retrieval_chain
 from langchain.chains.combine_documents import create_stuff_documents_chain
 
-# -------------------------- PART 1: DATA GENERATION --------------------------
+# 1. SIMULATE MS TEAMS CALL RECORDS (JSONL FILE)
 def generate_call_records_to_file(num_records=100, output_filename="sample_cdrs_for_analysis.jsonl"):
     sample_upns = [
         "adele.vance@contoso.com", "alex.wilber@contoso.com", "megan.bowen@contoso.com",
         "lynne.robbins@contoso.com", "diego.siciliani@contoso.com", "patti.ferguson@contoso.com"
     ]
+    platforms = ["windows", "macOS", "android", "iOS", "web"]
+    headsets = ["Jabra Evolve", "Logitech H390", "Plantronics Blackwire", "Generic Built-in", "Bose QC35", "Sony WH-1000XM4"]
+
     with open(output_filename, 'w') as f:
         for _ in range(num_records):
             call_type = random.choice(["groupCall", "peerToPeer"])
-            start_time = datetime.utcnow() - timedelta(minutes=random.randint(5, 120))
+            start_time = datetime.utcnow() - timedelta(minutes=random.randint(5, 2880)) # last 2 days
             jitter_value = random.uniform(0.005, 0.080) if random.random() > 0.3 else None
+            degradation = round(random.uniform(0.1, 1.0), 2) if random.random() > 0.6 else None
+            meeting_hour = start_time.hour
             flattened_data = {
                 "conferenceId": str(uuid.uuid4()),
                 "callType": call_type,
                 "startDateTime": start_time.isoformat() + "Z",
                 "modalities": random.sample(["audio", "video", "videoBasedScreenSharing"], k=random.randint(1, 3)),
                 "organizerUPN": random.choice(sample_upns),
-                "clientPlatform": random.choice(["windows", "macOS", "android"]),
+                "clientPlatform": random.choice(platforms),
+                "headsetModel": random.choice(headsets),
                 "averageJitter": f"PT{jitter_value:.3f}S" if jitter_value else None,
-                "averageAudioDegradation": round(random.uniform(0.1, 1.0), 2) if random.random() > 0.6 else None,
+                "averageAudioDegradation": degradation,
+                "packetLossRate": round(random.uniform(0.0, 0.12), 3),
+                "callHour": meeting_hour
             }
             f.write(json.dumps(flattened_data) + '\n')
 
-# --------------------- PART 2: DATA LOADING AND EXTRACTION --------------------
+# 2. LOAD & TRANSFORM FOR EMBEDDING (MS TEAMS CDR -> LANGCHAIN DOCS)
 def load_cdr_documents_from_jsonl(filepath):
     documents = []
     with open(filepath, 'r') as f:
         for line in f:
             record = json.loads(line)
-            page_content = (
-                f"Call record for user {record.get('organizerUPN')} on {record.get('clientPlatform')}. "
-                f"Call type was {record.get('callType')}. "
-                f"Quality metrics show average jitter of {record.get('averageJitter', 'N/A')} "
-                f"and audio degradation of {record.get('averageAudioDegradation', 'N/A')}."
+            # Construct an indexed string for retrieval—add all call metrics!
+            summary = (
+                f"User: {record.get('organizerUPN')}, Platform: {record.get('clientPlatform')}, Headset: {record.get('headsetModel')}. "
+                f"CallType: {record.get('callType')}, Time: {record.get('startDateTime')}, "
+                f"Modalities: {', '.join(record.get('modalities', []))}. "
+                f"Metrics: Jitter: {record.get('averageJitter', 'N/A')}, "
+                f"AudioDegradation: {record.get('averageAudioDegradation', 'N/A')}, "
+                f"PacketLoss: {record.get('packetLossRate', 'N/A')}. "
+                f"Hour: {record.get('callHour', 'N/A')}"
             )
-            documents.append(Document(page_content=page_content, metadata=record))
+            documents.append(Document(page_content=summary, metadata=record))
     return documents
 
-# ----------------- PART 3: EMBEDDINGS AND FAISS VECTOR STORE ------------------
+# 3. BUILD FAISS INDEX USING AZURE OPENAI EMBEDDINGS
 def build_faiss_index(documents, azure_embedding_args, faiss_index_path):
     embeddings_model = AzureOpenAIEmbeddings(**azure_embedding_args)
     vector_store = FAISS.from_documents(documents, embeddings_model)
     vector_store.save_local(faiss_index_path)
     return vector_store
 
-# ---------------------- PART 4: QUERYING THE RAG CHAIN ------------------------
+# 4. RAG CHAIN: RETRIEVE + ACTIONABLE INSIGHT GENERATION
 def query_rag_chain(vector_store, azure_chat_args, question):
+    # Prompt instructs GPT to focus on actionable, data-driven advice
+    local_prompt_template = """
+You are an expert Teams call analytics assistant.
+- Use ONLY the provided call record data to answer.
+- Your answer must contain actionable insights.
+- If you detect a pattern (e.g., high packet loss during a certain hour, one platform/headset with bad performance), mention it and suggest a concrete action (e.g., 'change your headset', 'avoid 3pm calls', 'try a different device').
+- If the data is insufficient, say so politely.
+
+Here are the relevant call records:
+{context}
+
+Question: {input}
+Actionable Insight:
+"""
+    from langchain.prompts import PromptTemplate
     llm = AzureChatOpenAI(**azure_chat_args)
-    prompt = hub.pull("rlm/rag-prompt")
+    prompt = PromptTemplate.from_template(local_prompt_template)
     combine_docs_chain = create_stuff_documents_chain(llm, prompt)
     retrieval_chain = create_retrieval_chain(vector_store.as_retriever(), combine_docs_chain)
     result = retrieval_chain.invoke({"input": question})
     return result["answer"]
 
-# -------------------------------- MAIN BLOCK ----------------------------------
+# -------------------------- MAIN EXECUTION --------------------------
 if __name__ == "__main__":
     load_dotenv()
 
@@ -93,33 +120,29 @@ if __name__ == "__main__":
         "temperature": 0,
     }
 
-    # 1. Generate sample data
-    print("--- 1. Generating sample call records ---")
+    print("--- 1. Generating sample MS Teams call records ---")
     generate_call_records_to_file(num_records=100, output_filename=cdr_filename)
 
-    # 2. Load docs and build index
-    print("--- 2. Loading documents and building FAISS index ---")
+    print("--- 2. Loading and indexing call data ---")
     docs = load_cdr_documents_from_jsonl(cdr_filename)
     vector_store = build_faiss_index(docs, azure_embedding_args, faiss_index_path)
 
-    # 3. General query
-    general_q = (
-        "Analyze the call data. Are there any users or platforms with notably poor call quality? "
-        "Summarize your findings and suggest an action."
-    )
+    # EXAMPLE QUERIES
     print("\n=======================================")
     print("         GENERAL ACTIONABLE INSIGHT")
     print("=======================================")
-    print(query_rag_chain(vector_store, azure_chat_args, general_q))
+    print(query_rag_chain(
+        vector_store, azure_chat_args,
+        "Give actionable suggestions based on all call records. Do you see issues with certain platforms, headsets, or time slots?"
+    ))
 
-    # 4. User-specific query
+    # Query for a specific user
     specific_user = "adele.vance@contoso.com"
-    specific_q = (
-        f"Analyze all call records specifically for the user {specific_user} "
-        "and summarize any quality issues you find in their records."
-    )
     print("\n=======================================")
     print(f"    ACTIONABLE INSIGHT for {specific_user}")
     print("=======================================")
-    print(query_rag_chain(vector_store, azure_chat_args, specific_q))
+    print(query_rag_chain(
+        vector_store, azure_chat_args,
+        f"Analyze all call records for {specific_user}. Summarize any technical problems or patterns and what should be done to improve their experience."
+    ))
     print("=======================================\n")
