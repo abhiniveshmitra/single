@@ -1,109 +1,65 @@
 import json
-import uuid
-import random
-from datetime import datetime, timedelta
 from pathlib import Path
-import shutil
 
 CREATED_JSON_DIR = Path("created_json")
-if CREATED_JSON_DIR.exists():
-    shutil.rmtree(CREATED_JSON_DIR)
-CREATED_JSON_DIR.mkdir(exist_ok=True)
+OUTPUT_JSONL = "flattened_cdrs.jsonl"
 
-def random_ip():
-    return ".".join(str(random.randint(1,254)) for _ in range(4))
+def flatten_record(record):
+    organizer = record.get("organizerUPN")
+    call_type = record.get("callType")
+    conference_id = record.get("conferenceId")
+    sessions = record.get("sessions", [])
 
-def random_timestamp():
-    start_date = datetime(2024,1,1)
-    end_date = datetime(2024,12,31)
-    delta = end_date - start_date
-    rand_date = start_date + timedelta(seconds=random.randint(0, int(delta.total_seconds())))
-    duration = timedelta(minutes=random.randint(1, 60))
-    return rand_date.isoformat(), (rand_date + duration).isoformat() + "Z"
+    flat = {
+        "organizerUPN": organizer,
+        "callType": call_type,
+        "conferenceId": conference_id,
+        "sessionCount": len(sessions),
+        "participantRoles": [],
+        "notableMetrics": [],
+    }
 
-def generate_device_metrics():
-    # About 15% have bad log metrics: glitchRate > 2.5 or sentSignalLevel < 10
-    is_log_issue = random.random() < 0.15
-    if is_log_issue:
-        glitch_rate = round(random.uniform(2.6, 5), 2)
-        sent_signal = random.randint(0, 9)
-    else:
-        glitch_rate = round(random.uniform(0, 2.5), 2)
-        sent_signal = random.randint(10, 100)
+    for session in sessions:
+        for participant in session.get("participants", []):
+            role = participant.get("role", "")
+            platform = participant.get("platform", "")
+            flat["participantRoles"].append(f"{role}({platform})")
+            for stream in participant.get("streams", []):
+                avg_jitter = stream.get("averageJitter")
+                packet_loss = stream.get("packetLossRate")
+                avg_rtt = stream.get("averageRoundTripTime")
+                device_metrics = stream.get("deviceMetrics", {})
+                glitch_rate = device_metrics.get("glitchRate")
+                sent_signal = device_metrics.get("sentSignalLevel")
+
+                desc = (
+                    f"role:{role} platform:{platform} "
+                    f"avgJitter:{avg_jitter} packetLoss:{packet_loss} "
+                    f"avgRTT:{avg_rtt} glitchRate:{glitch_rate} sentSignalLevel:{sent_signal}"
+                )
+                flat["notableMetrics"].append(desc)
+
+    # Build summary string that includes platform and all key metrics for agent routing
+    summary = (
+        f"Call by {organizer}, type: {call_type}. "
+        f"Participants: {', '.join(flat['participantRoles'])}. "
+        f"Session count: {flat['sessionCount']}. "
+        f"Metrics: {' | '.join(flat['notableMetrics'])}."
+    )
+
     return {
-        "sentSignalLevel": sent_signal,
-        "sentNoiseLevel": random.randint(0,50),
-        "inputClippingEventRatio": round(random.uniform(0,0.2),2),
-        "deviceClippingEventRatio": round(random.uniform(0,0.2),2),
-        "glitchRate": glitch_rate,
-        "speakerGlitchRate": round(random.uniform(0,5),2)
+        "conferenceId": conference_id,
+        "organizerUPN": organizer,
+        "summary": summary,
+        "notableMetrics": flat["notableMetrics"]
     }
-
-def create_stream():
-    start, end = random_timestamp()
-    return {
-        "streamId": str(uuid.uuid4()),
-        "streamType": random.choice(["callerToCallee", "calleeToCaller"]),
-        "averageJitter": round(random.uniform(0.0, 0.15), 2),
-        "packetLossRate": round(random.uniform(0.0, 0.12), 3),
-        "averageRoundTripTime": round(random.uniform(100.0,200.0),1),
-        "startDateTime": start,
-        "endDateTime": end,
-        "deviceMetrics": generate_device_metrics()
-    }
-
-def create_network_info():
-    return {
-        "networkType": random.choice(["wired", "wireless"]),
-        "averageBandwidthEstimate": random.randint(25000,90000),
-        "averageReorderRatio": round(random.uniform(0,0.2),2),
-        "ipAddress": random_ip()
-    }
-
-VDI_PLATFORMS = ["vdi", "citrix", "vmware"]
-
-def create_participant():
-    # About 20% VDI, rest normal
-    is_vdi = random.random() < 0.20
-    if is_vdi:
-        platform = random.choice(VDI_PLATFORMS)
-    else:
-        platform = random.choice(["windows", "macOS", "android", "iOS", "web"])
-    return {
-        "participantId": str(uuid.uuid4()),
-        "role": random.choice(["organizer","presenter","attendee"]),
-        "platform": platform,
-        "networkInfo": create_network_info(),
-        "streams": [create_stream() for _ in range(random.randint(1,2))]
-    }
-
-def create_session():
-    num_participants = random.randint(2,5)
-    participants = [create_participant() for _ in range(num_participants)]
-    start, end = random_timestamp()
-    return {
-        "sessionId": str(uuid.uuid4()),
-        "startDateTime": start,
-        "endDateTime": end,
-        "participants": participants
-    }
-
-def create_cdr_record():
-    record = {
-        "conferenceId": str(uuid.uuid4()),
-        "callType": random.choice(["groupCall", "peerToPeer"]),
-        "organizerUPN": random.choice([
-            "adele.vance@contoso.com", "alex.wilber@contoso.com", "megan.bowen@contoso.com",
-            "lynne.robbins@contoso.com", "diego.siciliani@contoso.com", "patti.ferguson@contoso.com"
-        ]),
-        "sessions": [create_session() for _ in range(random.randint(1,2))]
-    }
-    return record
 
 if __name__ == "__main__":
-    NUM_RECORDS = 50
-    for i in range(NUM_RECORDS):
-        rec = create_cdr_record()
-        with open(CREATED_JSON_DIR / f"cdr_{i+1:03d}.json", "w") as f:
-            json.dump(rec, f, indent=2)
-    print(f"Created {NUM_RECORDS} sample CDR files in {CREATED_JSON_DIR} (with ~20% VDI, ~15% log issue)")
+    files = list(CREATED_JSON_DIR.glob("*.json"))
+    with open(OUTPUT_JSONL, "w") as fout:
+        for fp in files:
+            with open(fp) as fin:
+                rec = json.load(fin)
+                flat = flatten_record(rec)
+                fout.write(json.dumps(flat) + "\n")
+    print(f"Flattened {len(files)} records into {OUTPUT_JSONL}")
