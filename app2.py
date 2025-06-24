@@ -22,12 +22,20 @@ def random_timestamp():
     return rand_date.isoformat(), (rand_date + duration).isoformat() + "Z"
 
 def generate_device_metrics():
+    # About 15% have bad log metrics: glitchRate > 2.5 or sentSignalLevel < 10
+    is_log_issue = random.random() < 0.15
+    if is_log_issue:
+        glitch_rate = round(random.uniform(2.6, 5), 2)
+        sent_signal = random.randint(0, 9)
+    else:
+        glitch_rate = round(random.uniform(0, 2.5), 2)
+        sent_signal = random.randint(10, 100)
     return {
-        "sentSignalLevel": random.randint(0,100),
+        "sentSignalLevel": sent_signal,
         "sentNoiseLevel": random.randint(0,50),
         "inputClippingEventRatio": round(random.uniform(0,0.2),2),
         "deviceClippingEventRatio": round(random.uniform(0,0.2),2),
-        "glitchRate": round(random.uniform(0,5),2),
+        "glitchRate": glitch_rate,
         "speakerGlitchRate": round(random.uniform(0,5),2)
     }
 
@@ -55,7 +63,7 @@ def create_network_info():
 VDI_PLATFORMS = ["vdi", "citrix", "vmware"]
 
 def create_participant():
-    # About 20% of participants are VDI (realistic in enterprise)
+    # About 20% VDI, rest normal
     is_vdi = random.random() < 0.20
     if is_vdi:
         platform = random.choice(VDI_PLATFORMS)
@@ -98,4 +106,4 @@ if __name__ == "__main__":
         rec = create_cdr_record()
         with open(CREATED_JSON_DIR / f"cdr_{i+1:03d}.json", "w") as f:
             json.dump(rec, f, indent=2)
-    print(f"Created {NUM_RECORDS} sample CDR files in {CREATED_JSON_DIR} (with ~20% VDI participants)")
+    print(f"Created {NUM_RECORDS} sample CDR files in {CREATED_JSON_DIR} (with ~20% VDI, ~15% log issue)")
