@@ -1,65 +1,73 @@
 import json
-from pathlib import Path
+from agents.network_agent import analyze_network
+from agents.vdi_agent import analyze_vdi
+from agents.log_agent import analyze_logs
 
-CREATED_JSON_DIR = Path("created_json")
-OUTPUT_JSONL = "flattened_cdrs.jsonl"
+def route_record(record):
+    # 1. Network conditions (packet loss, jitter, RTT)
+    for metric in record.get("notableMetrics", []):
+        # Packet loss
+        if "packetLoss:" in metric:
+            try:
+                packet_loss = float(metric.split("packetLoss:")[1].split()[0])
+                if packet_loss > 0.05:
+                    return "Network"
+            except Exception:
+                pass
+        # Jitter
+        if "avgJitter:" in metric:
+            try:
+                avg_jitter = float(metric.split("avgJitter:")[1].split()[0])
+                if avg_jitter > 0.08:
+                    return "Network"
+            except Exception:
+                pass
+        # RTT
+        if "avgRTT:" in metric:
+            try:
+                avg_rtt = float(metric.split("avgRTT:")[1].split()[0])
+                if avg_rtt > 200:
+                    return "Network"
+            except Exception:
+                pass
 
-def flatten_record(record):
-    organizer = record.get("organizerUPN")
-    call_type = record.get("callType")
-    conference_id = record.get("conferenceId")
-    sessions = record.get("sessions", [])
+    # 2. VDI (platform keywords in metrics or participant roles)
+    summary = record.get("summary", "").lower()
+    vdi_keywords = ["vdi", "virtual desktop", "citrix", "vmware", "remote"]
+    if any(kw in summary for kw in vdi_keywords):
+        return "VDI"
 
-    flat = {
-        "organizerUPN": organizer,
-        "callType": call_type,
-        "conferenceId": conference_id,
-        "sessionCount": len(sessions),
-        "participantRoles": [],
-        "notableMetrics": [],
-    }
+    # 3. Device/log issues (glitchRate, sentSignalLevel)
+    for metric in record.get("notableMetrics", []):
+        # GlitchRate
+        if "glitchRate:" in metric:
+            try:
+                glitch_rate = float(metric.split("glitchRate:")[1].split()[0])
+                if glitch_rate is not None and glitch_rate > 2.5:
+                    return "Log"
+            except Exception:
+                pass
+        # sentSignalLevel
+        if "sentSignalLevel:" in metric:
+            try:
+                signal_level = float(metric.split("sentSignalLevel:")[1].split()[0])
+                if signal_level is not None and signal_level < 10:
+                    return "Log"
+            except Exception:
+                pass
 
-    for session in sessions:
-        for participant in session.get("participants", []):
-            role = participant.get("role", "")
-            platform = participant.get("platform", "")
-            flat["participantRoles"].append(f"{role}({platform})")
-            for stream in participant.get("streams", []):
-                avg_jitter = stream.get("averageJitter")
-                packet_loss = stream.get("packetLossRate")
-                avg_rtt = stream.get("averageRoundTripTime")
-                device_metrics = stream.get("deviceMetrics", {})
-                glitch_rate = device_metrics.get("glitchRate")
-                sent_signal = device_metrics.get("sentSignalLevel")
-
-                desc = (
-                    f"role:{role} platform:{platform} "
-                    f"avgJitter:{avg_jitter} packetLoss:{packet_loss} "
-                    f"avgRTT:{avg_rtt} glitchRate:{glitch_rate} sentSignalLevel:{sent_signal}"
-                )
-                flat["notableMetrics"].append(desc)
-
-    # Build summary string that includes platform and all key metrics for agent routing
-    summary = (
-        f"Call by {organizer}, type: {call_type}. "
-        f"Participants: {', '.join(flat['participantRoles'])}. "
-        f"Session count: {flat['sessionCount']}. "
-        f"Metrics: {' | '.join(flat['notableMetrics'])}."
-    )
-
-    return {
-        "conferenceId": conference_id,
-        "organizerUPN": organizer,
-        "summary": summary,
-        "notableMetrics": flat["notableMetrics"]
-    }
+    return None
 
 if __name__ == "__main__":
-    files = list(CREATED_JSON_DIR.glob("*.json"))
-    with open(OUTPUT_JSONL, "w") as fout:
-        for fp in files:
-            with open(fp) as fin:
-                rec = json.load(fin)
-                flat = flatten_record(rec)
-                fout.write(json.dumps(flat) + "\n")
-    print(f"Flattened {len(files)} records into {OUTPUT_JSONL}")
+    with open("flattened_cdrs.jsonl") as fin:
+        for line in fin:
+            record = json.loads(line)
+            route = route_record(record)
+            if route == "Network":
+                analyze_network(record)
+            elif route == "VDI":
+                analyze_vdi(record)
+            elif route == "Log":
+                analyze_logs(record)
+            else:
+                print(f"Call {record.get('conferenceId')}: No issue detected")
