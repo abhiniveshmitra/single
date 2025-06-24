@@ -3,37 +3,47 @@ from agents.network_agent import analyze_network
 from agents.vdi_agent import analyze_vdi
 from agents.log_agent import analyze_logs
 
+# === PARAMETERS: Adjust here ===
+
+NETWORK_PACKETLOSS_THRESHOLD = 0.05    # e.g. 0.05 = 5%
+NETWORK_JITTER_THRESHOLD = 0.08        # e.g. 0.08 = 80 ms
+NETWORK_RTT_THRESHOLD = 200            # ms
+
+LOG_GLITCHRATE_THRESHOLD = 2.5         # e.g. >2.5 means problematic device
+LOG_SIGNALLEVEL_THRESHOLD = 10         # e.g. <10 means mic is too quiet
+
+VDI_KEYWORDS = ["vdi", "virtual desktop", "citrix", "vmware", "remote"]
+
+# === END PARAMETERS ===
+
 def route_record(record):
     fired = None
     reasons = []
 
-    # 1. Network conditions (packet loss, jitter, RTT)
+    # 1. Network conditions
     for metric in record.get("notableMetrics", []):
-        # Packet loss
         if "packetLoss:" in metric:
             try:
                 packet_loss = float(metric.split("packetLoss:")[1].split()[0])
-                if packet_loss > 0.05:
+                if packet_loss > NETWORK_PACKETLOSS_THRESHOLD:
                     fired = "Network"
                     reasons.append(f"packetLoss={packet_loss}")
                     break
             except Exception as e:
                 reasons.append(f"packet_loss parse fail: {e}")
-        # Jitter
         if "avgJitter:" in metric:
             try:
                 avg_jitter = float(metric.split("avgJitter:")[1].split()[0])
-                if avg_jitter > 0.08:
+                if avg_jitter > NETWORK_JITTER_THRESHOLD:
                     fired = "Network"
                     reasons.append(f"avgJitter={avg_jitter}")
                     break
             except Exception as e:
                 reasons.append(f"avg_jitter parse fail: {e}")
-        # RTT
         if "avgRTT:" in metric:
             try:
                 avg_rtt = float(metric.split("avgRTT:")[1].split()[0])
-                if avg_rtt > 200:
+                if avg_rtt > NETWORK_RTT_THRESHOLD:
                     fired = "Network"
                     reasons.append(f"avgRTT={avg_rtt}")
                     break
@@ -42,31 +52,28 @@ def route_record(record):
     if fired:
         return fired, reasons
 
-    # 2. VDI (platform keywords in metrics or participant roles)
+    # 2. VDI
     summary = record.get("summary", "").lower()
-    vdi_keywords = ["vdi", "virtual desktop", "citrix", "vmware", "remote"]
-    if any(kw in summary for kw in vdi_keywords):
+    if any(kw in summary for kw in VDI_KEYWORDS):
         fired = "VDI"
         reasons.append("VDI keyword found in summary")
         return fired, reasons
 
-    # 3. Device/log issues (glitchRate, sentSignalLevel)
+    # 3. Log/device
     for metric in record.get("notableMetrics", []):
-        # GlitchRate
         if "glitchRate:" in metric:
             try:
                 glitch_rate = float(metric.split("glitchRate:")[1].split()[0])
-                if glitch_rate is not None and glitch_rate > 2.5:
+                if glitch_rate is not None and glitch_rate > LOG_GLITCHRATE_THRESHOLD:
                     fired = "Log"
                     reasons.append(f"glitchRate={glitch_rate}")
                     break
             except Exception as e:
                 reasons.append(f"glitch_rate parse fail: {e}")
-        # sentSignalLevel
         if "sentSignalLevel:" in metric:
             try:
                 signal_level = float(metric.split("sentSignalLevel:")[1].split()[0])
-                if signal_level is not None and signal_level < 10:
+                if signal_level is not None and signal_level < LOG_SIGNALLEVEL_THRESHOLD:
                     fired = "Log"
                     reasons.append(f"sentSignalLevel={signal_level}")
                     break
