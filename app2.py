@@ -1,1 +1,1 @@
-az provider show --namespace Microsoft.AzureAI.Foundry --query "registrationState" --output tsv
+az provider list --query "[?contains(namespace, 'Azure')]" --output table
