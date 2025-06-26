@@ -4,7 +4,7 @@
   "parameters": {
     "searchServiceName": {
       "type": "string",
-      "defaultValue": "mysearchservice"
+      "defaultValue": "eus-cdr-ai-search"
     },
     "searchSku": {
       "type": "string",
