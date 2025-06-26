@@ -44,3 +44,4 @@
     }
   ]
 }
+az deployment group create --resource-group rg-abhinivesh.mitra-1469 --template-file "C:\Users\e819643\Documents\azure-ai-resources.json" --parameters searchServiceName=eus-cdr-ai-search foundryWorkspaceName=myfoundryws location=westeurope
