@@ -1,153 +1,186 @@
 import os
-import json
-from typing import TypedDict, List
+import uuid
+import logging
+import pandas as pd
+import io
+from contextlib import redirect_stdout
+from typing import TypedDict, List, Any, Dict
 from dotenv import load_dotenv
-from langchain_openai import AzureChatOpenAI
 from azure.core.credentials import AzureKeyCredential
 from azure.search.documents import SearchClient
+from langchain_openai import AzureChatOpenAI
 from langgraph.graph import StateGraph, END
 
-# Load environment variables from the .env file
+# Load environment variables from .env file
 load_dotenv()
 
-# --- Azure Service Configurations ---
-SEARCH_ENDPOINT = os.getenv("AZURE_SEARCH_ENDPOINT")
-SEARCH_API_KEY = os.getenv("AZURE_SEARCH_API_KEY")
-SEARCH_INDEX_NAME = os.getenv("AZURE_SEARCH_INDEX_NAME")
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
-OPENAI_API_KEY = os.getenv("AZURE_OPENAI_KEY")
-OPENAI_DEPLOYMENT_NAME = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
-
-# --- 1. Define the Graph's State ---
-class VdiAnalysisState(TypedDict):
-    input_payload: dict
-    search_query: str
-    search_results: List[dict]
-    analysis_report: dict
-    error: str
-
-# --- 2. Define Agent Nodes (Functions) ---
-
-def query_vdi_logs(state: VdiAnalysisState) -> VdiAnalysisState:
-    print("--- Node: Querying VDI Logs ---")
-    try:
-        user_id = state.get("input_payload", {}).get("user_id")
-        if not user_id:
-            return {"error": "user_id not found in the input payload."}
-
-        search_credential = AzureKeyCredential(SEARCH_API_KEY)
-        search_client = SearchClient(endpoint=SEARCH_ENDPOINT,
-                                     index_name=SEARCH_INDEX_NAME,
-                                     credential=search_credential)
-
-        filter_query = f"user_id eq '{user_id}'"
-        
-        results = search_client.search(
-            search_text="*", filter=filter_query, include_total_count=True, top=25
-        )
-
-        records = [result for result in results]
-        if not records:
-            # IMPORTANT: Set an error message if no records are found
-            return {"error": f"No VDI logs found for user_id: {user_id}"}
-        
-        return {"search_results": records}
-
-    except Exception as e:
-        return {"error": f"Failed to query Azure AI Search: {e}"}
-
-def analyze_with_vdi_expertise(state: VdiAnalysisState) -> VdiAnalysisState:
-    print("--- Node: Analyzing Data with VDI/Citrix Expertise ---")
-    # This node now only runs if search_results exist, so no need for the initial check.
-    try:
-        search_results = state.get("search_results")
-        problem_description = state.get("input_payload", {}).get("problem_description")
-        
-        llm = AzureChatOpenAI(
-            azure_endpoint=OPENAI_ENDPOINT, api_key=OPENAI_API_KEY, api_version="2024-02-01",
-            azure_deployment=OPENAI_DEPLOYMENT_NAME, temperature=0.2
-        )
-
-        system_prompt = (
-            "You are an expert-level AI analyst with deep, specialized knowledge of Virtual Desktop Infrastructure (VDI), focusing on Citrix Workspace. "
-            "Your task is to analyze raw VDI monitoring logs in the context of a user-reported problem. "
-            "Your final output MUST be a single, valid JSON object."
-        )
-
-        user_prompt = f"""
-        Analyze the following user problem and associated VDI logs.
-        
-        User Problem: "{problem_description}"
-        VDI Log Data: {json.dumps(search_results, indent=2)}
-
-        Based on your expertise, generate a structured JSON analysis with fields: "analysis_summary", "key_vdi_metrics", "insights", "recommendations", and "sentiment".
-        """
-
-        response = llm.invoke(
-            [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
-            response_format={"type": "json_object"}
-        )
-        
-        report = json.loads(response.content)
-        return {"analysis_report": report}
-
-    except Exception as e:
-        return {"error": f"Failed to generate analysis from Azure OpenAI: {e}"}
-
-# --- 3. Define Conditional Routing Logic ---
-
-def should_analyze_data(state: VdiAnalysisState) -> str:
+# --- Graph State Definition ---
+class GraphState(TypedDict):
     """
-    This function decides the next step. If search results exist, it routes to
-    the analysis node. Otherwise, it ends the process.
+    Represents the state of our graph.
+    Attributes:
+        keys: A dictionary to hold session data.
     """
-    print("--- Condition: Checking for search results ---")
-    if state.get("search_results"):
-        print("Decision: Search results found. Proceeding to analysis.")
-        return "analyze_with_vdi_expertise"
-    else:
-        print("Decision: No search results. Ending execution.")
-        return END
+    keys: Dict[str, Any]
 
-# --- 4. Build the Graph with Conditional Edges ---
+# --- Client Setup ---
+def create_search_client() -> SearchClient:
+    """Creates and returns an Azure AI Search client."""
+    endpoint = os.getenv("AZURE_SEARCH_ENDPOINT")
+    key = os.getenv("AZURE_SEARCH_KEY")
+    index_name = os.getenv("AZURE_SEARCH_INDEX") # Confirmed as "teams" from your image [1]
+    return SearchClient(endpoint=endpoint, index_name=index_name, credential=AzureKeyCredential(key))
 
-workflow = StateGraph(VdiAnalysisState)
+def create_openai_client() -> AzureChatOpenAI:
+    """Creates and returns an Azure OpenAI client."""
+    return AzureChatOpenAI(
+        azure_deployment=os.getenv("AZURE_OPENAI_DEPLOYMENT"),
+        openai_api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
+        temperature=0,
+    )
 
-# Add nodes to the graph
-workflow.add_node("query_vdi_logs", query_vdi_logs)
-workflow.add_node("analyze_with_vdi_expertise", analyze_with_vdi_expertise)
+# --- LangGraph Nodes ---
 
-# Define the graph's flow
-workflow.set_entry_point("query_vdi_logs")
-# ADDED: Add a conditional edge that uses our new routing function
-workflow.add_conditional_edges(
-    "query_vdi_logs",
-    should_analyze_data
-)
-# This final edge connects the analysis node to the end of the graph
-workflow.add_edge("analyze_with_vdi_expertise", END)
+def analysis_node(state: GraphState) -> GraphState:
+    """
+    Fetches data, prepares it, and generates an analysis script.
+    """
+    logger.info("---ANALYSIS NODE---")
+    state_keys = state['keys']
+    question = state_keys['question']
+    search_client = state_keys['search_client']
+    llm = state_keys['llm']
 
-# Compile the final agent
-vdi_agent = workflow.compile()
+    # 1. Fetch all data directly from the Azure Search Index
+    logger.info("Fetching all documents from the index...")
+    try:
+        # Using search="*" retrieves all documents. Note: Azure Search has a default limit of 1000 docs per query.
+        # For very large datasets, pagination would be required.
+        search_results = search_client.search(search_text="*", top=5000, select=["*"])
+        documents = [result for result in search_results]
+        if not documents:
+            logger.warning("No documents found in the index. Stopping analysis.")
+            state_keys['final_answer'] = "No data was found in the search index to analyze."
+            state_keys['generated_code'] = None
+            return {"keys": state_keys}
+        logger.info(f"Successfully fetched {len(documents)} documents.")
+    except Exception as e:
+        logger.error(f"Failed to fetch documents from Azure Search: {e}")
+        state_keys['final_answer'] = f"Error: Could not retrieve data from the index. {e}"
+        state_keys['generated_code'] = None
+        return {"keys": state_keys}
 
-# --- 5. Main Execution Block ---
+    # 2. Load data into a pandas DataFrame and clean it
+    df = pd.DataFrame(documents)
+    
+    # Clean numeric columns to ensure they can be used in calculations
+    numeric_cols = [
+        "callDetails_Score", "audioQuality_Score", "videoQuality_Score",
+        "sessions_segments_media_streams_averageAudioNetworkJitter",
+        "sessions_segments_media_streams_averageVideoPacketLossRate",
+        "sessions_segments_media_streams_averageVideoFrameRate"
+    ]
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+    
+    # Store the DataFrame for the execution node
+    state_keys['dataframe'] = df
 
+    # 3. Generate a Python script based on the available data
+    system_prompt = """
+    You are a master VDI data analyst. A pandas DataFrame named `df` has been pre-loaded and is available in your environment.
+    Your task is to write a Python script to analyze this DataFrame to answer the user's question.
+
+    Instructions:
+    - Your script must use the DataFrame named `df`.
+    - Do not include code to load data (e.g., from a CSV).
+    - Analyze the data and use the `print()` function to output your findings in a clear, human-readable format.
+    - The output should be the final answer, not just raw data.
+    """
+
+    prompt = f"""
+    User Question: "{question}"
+
+    Here is the head of the available DataFrame `df`:
+    {df.head().to_markdown()}
+
+    Write the Python code to perform the analysis and print the answer now.
+    """
+
+    response = llm.invoke(system_prompt + prompt)
+    # The generated code is Python code block, extract it
+    generated_code = response.content.strip().replace("``````", "")
+    state_keys['generated_code'] = generated_code
+    
+    return {"keys": state_keys}
+
+def execution_node(state: GraphState) -> GraphState:
+    """
+    Executes the generated Python code to get the final answer.
+    """
+    logger.info("---EXECUTION NODE---")
+    state_keys = state['keys']
+    generated_code = state_keys.get('generated_code')
+
+    if not generated_code:
+        logger.warning("No code was generated, skipping execution.")
+        return {"keys": state_keys}
+
+    df = state_keys['dataframe']
+    
+    # Prepare the execution environment
+    local_scope = {"df": df, "pd": pd}
+    output_buffer = io.StringIO()
+
+    logger.info("Executing generated code...")
+    try:
+        # Capture the print output from the executed code
+        with redirect_stdout(output_buffer):
+            exec(generated_code, {"pd": pd}, local_scope)
+        
+        final_answer = output_buffer.getvalue()
+        state_keys['final_answer'] = final_answer
+        logger.info("Execution successful.")
+    except Exception as e:
+        logger.error(f"Error executing generated code: {e}")
+        state_keys['final_answer'] = f"An error occurred during analysis: {e}"
+
+    return {"keys": state_keys}
+
+# --- Graph Construction ---
+def build_graph() -> StateGraph:
+    """Builds and returns the LangGraph workflow."""
+    workflow = StateGraph(GraphState)
+    workflow.add_node("analyst", analysis_node)
+    workflow.add_node("executor", execution_node)
+
+    workflow.set_entry_point("analyst")
+    workflow.add_edge("analyst", "executor")
+    workflow.add_edge("executor", END)
+    
+    return workflow.compile()
+
+# --- Main Execution ---
 if __name__ == "__main__":
-    sample_payload = {
-        "user_id": "a13e5e078-aec5-4345-a630-1ea859a1555a", # A user that might not exist, to test the error path
-        "problem_description": "User reports that their Citrix session is frequently freezing."
+    app = build_graph()
+
+    # The agent now uses its internal clients, so we don't pass them in the initial state
+    initial_state = {
+        "keys": {
+            "question": "Which devices are associated with the worst video quality scores and high audio jitter? Show me the top 5.",
+            "search_client": create_search_client(),
+            "llm": create_openai_client(),
+        }
     }
 
-    inputs = {"input_payload": sample_payload}
+    logger.info(f"Invoking VDI Analyst Agent with question: '{initial_state['keys']['question']}'")
+    final_state = app.invoke(initial_state)
 
-    print("--- Starting VDI Expert Agent ---")
-    final_state = vdi_agent.invoke(inputs)
-
-    print("\n--- Agent Execution Finished ---")
-    if final_state.get("error"):
-        print("\n--- ERROR ---")
-        print(f"Agent stopped because: {final_state['error']}")
-    else:
-        print("\n--- Final Analysis Report ---")
-        print(json.dumps(final_state.get("analysis_report"), indent=2))
+    print("\n-------------------- FINAL ANSWER --------------------\n")
+    print(final_state['keys'].get('final_answer', 'No answer was produced.'))
+    print("\n------------------------------------------------------\n")
