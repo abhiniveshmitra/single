@@ -19,8 +19,6 @@ from azure.search.documents import SearchClient
 load_dotenv()
 
 # --- 1. Custom Tool Definition ---
-# This tool queries the 'teams-calls' index for a specific user.
-
 def search_vdi_data_for_user(user_id: str) -> str:
     """
     Searches the 'teams-calls' Azure AI Search index for a specific user's
@@ -35,7 +33,6 @@ def search_vdi_data_for_user(user_id: str) -> str:
             credential=AzureKeyCredential(os.environ["AZURE_SEARCH_KEY"])
         )
 
-        # Fields to retrieve, based on schema. Focus on identity, quality, and performance.
         select_fields = [
             "startDateTime", "endDateTime", "callOverallStatus",
             "audioQuality_Score", "videoQuality_Score",
@@ -43,16 +40,15 @@ def search_vdi_data_for_user(user_id: str) -> str:
             "sessions_segments_media_streams_averageRoundTripTime",
             "sessions_segments_media_streams_averageVideoPacketLossRate",
             "sessions_segments_media_streams_averageAudioNetworkJitter",
-            "sessions_segments_media_streams_cpuInsufficentEventRatio" # Critical for VDI
+            "sessions_segments_media_streams_cpuInsufficentEventRatio"
         ]
 
-        # Search for the user as either organizer, caller, or callee
         results = search_client.search(
             search_text="*",
             filter=f"organizer_user eq '{user_id}' or sessions_caller_identity_device eq '{user_id}' or sessions_callee_identity_device eq '{user_id}'",
             select=",".join(select_fields),
-            top=10, # Get the last 10 calls for analysis
-            order_by="startDateTime desc" # Get the most recent calls
+            top=10,
+            order_by="startDateTime desc"
         )
 
         call_records = [result for result in results]
@@ -67,13 +63,10 @@ def search_vdi_data_for_user(user_id: str) -> str:
         return f"An error occurred while searching: {str(e)}"
 
 # --- 2. Graph State Definition ---
-# Defines the structure that holds data as it moves through the agent.
 class VdiAnalysisState(TypedDict):
     messages: Annotated[List[BaseMessage], lambda x, y: x + y]
 
 # --- 3. Agent and Graph Construction ---
-
-# System prompt to define the agent's expertise and behavior
 AGENT_SYSTEM_PROMPT = """
 You are an expert performance analyst specializing in Virtual Desktop Infrastructure (VDI)
 and Microsoft Teams. Your goal is to analyze Teams Call Detail Records (CDR) to identify
@@ -92,8 +85,6 @@ Based on your analysis, formulate a final answer with two sections:
 2.  **Actionable Insights:** A list of concrete, numbered steps that an IT administrator should take to investigate and resolve the issue.
 """
 
-# *** THIS SECTION IS CORRECTED ***
-# Initialize the LLM from Azure OpenAI with all required credentials.
 llm = AzureChatOpenAI(
     azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
     api_key=os.getenv("AZURE_OPENAI_API_KEY"),
@@ -103,39 +94,35 @@ llm = AzureChatOpenAI(
     streaming=True
 )
 
-# Define the tools the agent can use
 tools = [search_vdi_data_for_user]
 tool_node = ToolNode(tools)
 
-# Create the agent prompt template
+# *** THIS SECTION IS CORRECTED ***
+# The prompt now includes the required 'agent_scratchpad' placeholder.
 prompt = ChatPromptTemplate.from_messages(
     [
         ("system", AGENT_SYSTEM_PROMPT),
         MessagesPlaceholder(variable_name="messages"),
+        MessagesPlaceholder(variable_name="agent_scratchpad"),
     ]
 )
 
-# Create the agent itself by binding the tools to the LLM
 agent = create_openai_tools_agent(llm, tools, prompt)
 
-# Define the nodes for the graph
 def agent_node(state: VdiAnalysisState):
-    """Invokes the agent to decide on the next action."""
     result = agent.invoke(state)
     return {"messages": result}
 
-# Define the graph logic
 workflow = StateGraph(VdiAnalysisState)
 workflow.add_node("agent", agent_node)
 workflow.add_node("tools", tool_node)
 
 workflow.set_entry_point("agent")
 
-# Conditional edge: after the agent runs, check if it should call a tool or finish
 def should_continue(state: VdiAnalysisState):
     if isinstance(state['messages'][-1], ToolMessage):
-        return "agent" # If a tool was just called, loop back to the agent for analysis
-    return END # If there are no tool calls, the agent has finished
+        return "agent"
+    return END
 
 workflow.add_conditional_edges(
     "agent",
@@ -143,7 +130,6 @@ workflow.add_conditional_edges(
 )
 workflow.add_edge("tools", "agent")
 
-# Compile the graph into a runnable application
 app = workflow.compile()
 
 # --- 4. Running the Agent ---
@@ -156,13 +142,15 @@ if __name__ == "__main__":
         if user_input.lower() == "exit":
             break
         
-        # Stream the agent's response
         inputs = {"messages": [("user", user_input)]}
         print("\nAI> ", end="", flush=True)
-        final_response = ""
+        # The agent executor logic from LangGraph handles the agent_scratchpad internally.
+        # We only need to stream the final response content.
         for chunk in app.stream(inputs, stream_mode="values"):
             message = chunk["messages"][-1]
             if message.content:
-                print(message.content, end="", flush=True)
-                final_response += message.content
+                # Only print content from the AI's final response, not tool calls.
+                if not isinstance(message, ToolMessage) and not message.tool_calls:
+                     print(message.content, end="", flush=True)
         print("\n")
+
